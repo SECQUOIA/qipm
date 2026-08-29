@@ -92,7 +92,7 @@ Each MPS file is first presolved by HiGHS, then the reduced LP is algebraically 
 
 After conversion, harmless zero rows with zero right-hand sides are removed. A zero row with a nonzero right-hand side is recorded as infeasible. The result is saved as a compressed NPZ file with extension `.std`. Variable shifts and the original MPS objective offset are stored as `obj_offset`, so $z_{\mathrm{mps}} = z_{\mathrm{std}} + \mathtt{obj\_offset}$.
 
-The transform stage writes `transform_status` (`ok`, `reduced_to_empty`, `infeasible`, `unbounded`, `unbounded_or_infeasible`, or `error:<ExceptionName>`) to `.data`. An unchanged successful transform preserves downstream results. A changed successful transform clears them; every non-success conversion outcome removes a stale `.std` and clears them.
+The transform stage writes `transform_status` (`ok`, `reduced_to_empty`, `infeasible`, `unbounded`, `unbounded_or_infeasible`, or `error:<ExceptionName>`) to `.data`. An unchanged successful transform preserves downstream results. A changed successful transform clears them; every non-success conversion outcome removes a stale `.std` and clears them. Stage `--show` commands report successful totals with a breakdown of non-success statuses.
 
 ### 3. Solve (optional)
 
@@ -113,9 +113,9 @@ Each instance is solved in two independent modes, controlled by `--format`:
 
 For `.std`, if the default solver fails (e.g. due to poor scaling), the solve is automatically retried with HiGHS's interior-point method.
 
-Each solve runs in a subprocess with a 10-minute timeout. HiGHS is configured with `threads=1` before every solve; when `solve.py` starts the process, it also defaults the OpenMP, OpenBLAS, and MKL thread-count environment variables to 1 unless the user has set them explicitly. In `both` mode, if the `.mps` solve times out, the `.std` solve is skipped for that instance. Wall-clock solve times are written to the instance's `.data` JSON and serve as the classical baseline for the quantum advantage comparison.
+Each solve runs in a subprocess with a 10-minute timeout. HiGHS is configured with `threads=1` before every solve; when `solve.py` starts the process, it also defaults the OpenMP, OpenBLAS, and MKL thread-count environment variables to 1 unless the user has set them explicitly. In `both` mode, if the `.mps` solve times out, the `.std` solve is recorded as `skipped_mps_timeout` without a runtime. Wall-clock solve times are written to the instance's `.data` JSON and serve as the classical baseline for the quantum advantage comparison.
 
-`solve_status_mps` and `solve_status_std` record `ok`, `ok_ipm`, `timeout`, `crashed`, `non_optimal`, or `error:<ExceptionName>`. Runtime keys are present only for optimal solves. The top-level `highs_version` and `highs_threads` keys record solve provenance; the last solve-stage run for either format wins.
+`solve_status_mps` and `solve_status_std` record `ok`, `ok_ipm`, `timeout`, `crashed`, `non_optimal`, `skipped_mps_timeout`, or `error:<ExceptionName>`. Runtime keys are present only for optimal solves. The top-level `highs_version` and `highs_threads` keys record solve provenance; the last solve-stage run for either format wins.
 
 ### 4. Benchmark
 
@@ -145,6 +145,7 @@ For each instance, the script reads $A$ from the `.std` file and writes these ke
 | `cycle_count_v` | Headline total cycle count |
 | `sparsity_v` | QLSA sparsity parameter $s$ |
 | `cond_v` | Condition-number bound $\kappa$ |
+| `cond_method_v` | How $\kappa$ was obtained: `exact`, `svds`, `probe_sigma_max`, `probe_sigma_min`, or `probe_both` |
 | `qlsa_queries_v` | Per-solve QLSA query count $\mathcal{Q}$ |
 | `tomography_reps_v` | Tomography repetition count $R$ |
 
@@ -184,15 +185,15 @@ $$
 \end{cases}
 $$
 
-OSS uses the larger factor because of its Hermitian dilation. The required repetition count is rounded up, and $\varepsilon = 0.1$.
+OSS uses the larger factor because of its Hermitian dilation. The required repetition count is rounded up, and $\varepsilon = 0.1$. Counts remain exact Python integers when the intermediate floating-point products overflow.
 
-`benchmark.py --refresh-counts` updates successful existing ledgers after the log-base correction and backfills the QLSA-query/tomography breakdown without rerunning basis construction or `svds`. It validates the old total exactly, reports anomalous records without changing them, and is safe to run repeatedly. This is a schema/log-base migration that preserves each record's stored parameters, not an algorithm-version upgrade. OSS records are cross-checked against the `.std` dimensions; records that predate the 2026-04-04 OSS convention change are reported for re-benchmarking instead of migrated. Class, cache-directory, and `--variant` selection work as for a normal benchmark run.
+`benchmark.py --refresh-counts` updates successful existing ledgers after the log-base correction and backfills the QLSA-query/tomography breakdown without rerunning basis construction or `svds`. It validates the old total exactly, reports anomalous records without changing them, exits nonzero when anomalies are found, and is safe to run repeatedly. This is a schema/log-base migration that preserves each record's stored parameters, not an algorithm-version upgrade. The OSS convention cross-check runs only when an instance directory has exactly one readable `.std`; otherwise refresh validates the arithmetic without establishing the record's convention vintage. Records whose repetition basis conflicts with readable `.std` dimensions are reported for re-benchmarking instead of migrated. Class, cache-directory, and `--variant` selection work as for a normal benchmark run.
 
 ### 5. Plot
 
 `plot.py` produces advantage curves, fixed-cycle ratio plots, and difficulty histograms from `.data`. The default classical baseline is now `--solver highs-std`; `glpk` and `highs-mps` remain available.
 
-Use `python plot.py --ratio` for fixed-cycle-time quantum/classical ratios. The default box style shows total $Q\times R$ and one QLSA state preparation (no readout) for MNES and OSS; `--ratio-style ecdf` selects empirical CDFs. `--cycle-time` sets the assumed cycle duration in seconds and defaults to $8\times10^{-10}$ s (800 ps), the $\sqrt{\mathrm{SWAP}}$ two-qubit gate reported by He et al., *Nature* **571**, 371 (2019), which Sec. V of the paper uses as an optimistic physical proxy for a logical cycle. Ratio plots require the breakdown keys produced by a current benchmark or `--refresh-counts`, and skip non-positive classical runtimes.
+Use `python plot.py --ratio` for fixed-cycle-time quantum/classical ratios. The default box style shows total $Q\times R$ and one QLSA state preparation (no readout) for MNES and OSS; `--ratio-style ecdf` selects empirical CDFs. `--cycle-time` sets the assumed cycle duration in seconds and defaults to $8\times10^{-10}$ s (800 ps), the $\sqrt{\mathrm{SWAP}}$ two-qubit gate reported by He et al., *Nature* **571**, 371 (2019), which Sec. V of the paper uses as an optimistic physical proxy for a logical cycle. Ratio plots require the breakdown keys produced by a current benchmark or `--refresh-counts`, and report records skipped for non-positive classical runtimes or ratios too large for plotting.
 
 Plotting enables Matplotlib's LaTeX renderer, so a working LaTeX installation is required in addition to the Python packages.
 

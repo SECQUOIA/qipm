@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 import math
 import multiprocessing
 import signal
@@ -69,6 +70,7 @@ class CycleCountResult:
     count: int
     sparsity: int
     cond: float
+    cond_method: str
     qlsa_queries: int
     repetitions: int
 
@@ -92,13 +94,25 @@ def cycle_count_qlsa(
     """
     if s <= 0 or k < 1 or epsilon <= 0 or not math.isfinite(k):
         raise ValueError("s and epsilon must be positive and k must be finite and at least 1")
-    sk = float(s) * k
-    if not math.isfinite(sk) or sk > math.sqrt(np.finfo(np.float64).max):
-        raise OverflowError("s*k is too large for the QLSA cycle-count formula")
-    binst = math.ceil(math.log2(sk / epsilon) * sk**2)
-    insqrt = binst * math.log2(4 * binst / epsilon)
-    j0_val = int(math.ceil(math.sqrt(insqrt)))
-    return 8 * j0_val
+    try:
+        sk = float(s) * k
+        binst = math.ceil(math.log2(sk / epsilon) * sk**2)
+        insqrt = binst * math.log2(4 * binst / epsilon)
+        return 8 * int(math.ceil(math.sqrt(insqrt)))
+    except OverflowError:
+        pass
+
+    k_num, k_den = float(k).as_integer_ratio()
+    sk = Fraction(s * k_num, k_den)
+    lg1 = math.log2(s * k_num) - math.log2(k_den) - math.log2(epsilon)
+    binst = math.ceil(Fraction(lg1) * sk * sk)
+    lg2 = math.log2(binst) + 2.0 - math.log2(epsilon)
+    insqrt = Fraction(lg2) * binst
+    n = max(math.ceil(insqrt), 0)
+    result = math.isqrt(n)
+    if result * result < n:
+        result += 1
+    return 8 * result
 
 
 def _preprocess_basis_worker(queue: multiprocessing.Queue, A: csr_matrix) -> None:
@@ -300,8 +314,10 @@ def _cycle_count_mnes_from_basis(basis: PreparedBasis) -> CycleCountResult:
     if n_N == 0:
         s = 1
         k = 1.0
+        cond_method = "exact"
     elif A_N.nnz == 0 or m <= 1:
         k = 1.0
+        cond_method = "exact"
     else:
         def _fbar_mv(v: np.ndarray) -> np.ndarray:
             return A_B_lu.solve(np.asarray(A_N @ v, dtype=np.float64).ravel())
@@ -314,9 +330,11 @@ def _cycle_count_mnes_from_basis(basis: PreparedBasis) -> CycleCountResult:
             sigma_max = float(np.linalg.norm(_fbar_mv(np.ones(1, dtype=np.float64))))
             lam_max = 1.0 + sigma_max ** 2
             lam_min = 1.0  # n_N = 1 < m → null space of F̄F̄ᵀ is non-trivial
+            cond_method = "exact"
         else:
             F_op = LinearOperator((m, n_N), matvec=_fbar_mv, rmatvec=_fbar_rmv, dtype=np.float64)
             sigma_max = _sigma_timed(F_op, "LM", _MNES_SM_TIMEOUT)
+            probed_max = sigma_max is None
             if sigma_max is None:
                 sigma_max = _sigma_max_random_probes(
                     _fbar_mv, n_N, _MNES_N_PROBES, _MNES_SM_TIMEOUT
@@ -332,6 +350,7 @@ def _cycle_count_mnes_from_basis(basis: PreparedBasis) -> CycleCountResult:
                 # back to random Rayleigh-quotient probes, which are cheaper but
                 # potentially looser upper bounds on σ_min.
                 sigma_min = _sigma_timed(F_op, "SM", _MNES_SM_TIMEOUT)
+                probed_min = sigma_min is None
                 if sigma_min is None:
                     # Probe the left side. For unit u, ||Fbar.T u|| is an upper
                     # bound on the smallest singular value relevant to Fbar Fbar.T.
@@ -340,12 +359,21 @@ def _cycle_count_mnes_from_basis(basis: PreparedBasis) -> CycleCountResult:
                     )
                 lam_min = 1.0 + sigma_min ** 2
 
+            if probed_max and n_N >= m and probed_min:
+                cond_method = "probe_both"
+            elif probed_max:
+                cond_method = "probe_sigma_max"
+            elif n_N >= m and probed_min:
+                cond_method = "probe_sigma_min"
+            else:
+                cond_method = "svds"
+
         k = max(lam_max / lam_min, 1.0)
 
     repetitions = math.ceil((m - 1) / _EPSILON**2)
     qlsa_queries = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON)
     count = qlsa_queries * repetitions
-    return CycleCountResult(count, s, k, qlsa_queries, repetitions)
+    return CycleCountResult(count, s, k, cond_method, qlsa_queries, repetitions)
 
 
 def _cycle_count_mnes(A: csr_matrix) -> CycleCountResult:
@@ -417,20 +445,30 @@ def _cycle_count_oss_from_basis(basis: PreparedBasis) -> CycleCountResult:
 
     M_op = LinearOperator((n, n), matvec=_matvec, rmatvec=_rmatvec, dtype=np.float64)
     sigma_max = _sigma_timed(M_op, "LM", _OSS_SM_TIMEOUT)
+    probed_max = sigma_max is None
     if sigma_max is None:
         sigma_max = _sigma_max_random_probes(
             M_op.matvec, n, _OSS_N_PROBES, _OSS_SM_TIMEOUT
         )
     sigma_min = _sigma_timed(M_op, "SM", _OSS_SM_TIMEOUT)
+    probed_min = sigma_min is None
     if sigma_min is None:
         sigma_min = _sigma_min_random_probes(
             M_op.matvec, n, _OSS_N_PROBES, _OSS_SM_TIMEOUT
         )
     k = max(sigma_max / sigma_min, 1.0)
+    if probed_max and probed_min:
+        cond_method = "probe_both"
+    elif probed_max:
+        cond_method = "probe_sigma_max"
+    elif probed_min:
+        cond_method = "probe_sigma_min"
+    else:
+        cond_method = "svds"
     repetitions = math.ceil((2 * n - 1) / _EPSILON**2)
     qlsa_queries = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON)
     count = qlsa_queries * repetitions
-    return CycleCountResult(count, s, k, qlsa_queries, repetitions)
+    return CycleCountResult(count, s, k, cond_method, qlsa_queries, repetitions)
 
 
 def _cycle_count_oss(A: csr_matrix) -> CycleCountResult:

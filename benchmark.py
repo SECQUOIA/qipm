@@ -28,7 +28,6 @@ from store import (
     BENCHMARK_VALUE_KEYS,
     VARIANTS,
     atomic_write_json,
-    count_successful_records,
     list_class_names,
     list_instance_dirs,
     merge_ledger,
@@ -36,6 +35,8 @@ from store import (
     purge_keys_from_ledgers,
     read_ledger,
     resolve_cache_root,
+    stored_finite_number as _stored_finite_number,
+    summarize_records,
 )
 
 
@@ -117,6 +118,7 @@ def _benchmark_instance_from_path(
         data[keys.count] = result.count
         data[keys.sparsity] = result.sparsity
         data[keys.cond] = cond
+        data[keys.cond_method] = result.cond_method
         data[keys.qlsa_queries] = result.qlsa_queries
         data[keys.tomography_reps] = result.repetitions
         data[BENCHMARK_STATUS_KEYS[active]] = "ok"
@@ -223,6 +225,7 @@ def benchmark_all_instance_classes(
 
     for name in instance_classes:
         benchmark_instance_class(name, variant=variant, cache_dir=root)
+        show_benchmark_status([name], variant=variant, cache_dir=root)
 
 
 def show_benchmark_status(
@@ -230,7 +233,7 @@ def show_benchmark_status(
     variant: str = "both",
     cache_dir: str | Path | None = None,
 ) -> None:
-    """Print how many instances per class have all benchmark keys present in their .data files.
+    """Print successful benchmark counts and non-ok statuses by class.
 
     For each instance class, prints one line per active variant showing
     "<class>  [mnes: x/total]  [oss: x/total]".
@@ -254,8 +257,8 @@ def show_benchmark_status(
 
         subdirs = list_instance_dirs(folder)
         total = len(subdirs)
-        counts = {
-            active: count_successful_records(
+        summaries = {
+            active: summarize_records(
                 subdirs,
                 value_key=BENCHMARK_VALUE_KEYS[active].count,
                 status_key=BENCHMARK_STATUS_KEYS[active],
@@ -264,7 +267,15 @@ def show_benchmark_status(
             for active in active_variants
         }
 
-        parts = "  ".join(f"{v}: {counts[v]}/{total}" for v in active_variants)
+        parts = []
+        for active in active_variants:
+            count, non_ok = summaries[active]
+            breakdown = ", ".join(
+                f"{status}: {number}" for status, number in sorted(non_ok.items())
+            )
+            suffix = f" ({breakdown})" if breakdown else ""
+            parts.append(f"{active}: {count}/{total}{suffix}")
+        parts = "  ".join(parts)
         print(f"{cls}:  {parts}")
 
 
@@ -295,17 +306,11 @@ def _stored_integer(value: object) -> int | None:
     return int(value)
 
 
-def _stored_finite_number(value: object) -> bool:
-    if isinstance(value, int):
-        return True
-    return isinstance(value, float) and math.isfinite(value)
-
-
 def refresh_benchmark_counts(
     instance_classes: list[str] | None = None,
     cache_dir: str | Path | None = None,
     variant: str = "both",
-) -> None:
+) -> int:
     """Correct legacy ln-based totals and add their query/repetition breakdown."""
     root = resolve_cache_root(cache_dir)
     if not root.is_dir():
@@ -358,7 +363,7 @@ def refresh_benchmark_counts(
                     if s is None or s <= 0:
                         _report_anomaly(name, "sparsity must be a positive integer")
                         continue
-                    if isinstance(k, bool) or not _stored_finite_number(k) or k < 1:
+                    if not _stored_finite_number(k) or k < 1:
                         _report_anomaly(name, "condition number must be finite and at least 1")
                         continue
                     if total is None or total < 0:
@@ -446,8 +451,9 @@ def refresh_benchmark_counts(
                                 _report_anomaly(
                                     name,
                                     "OSS repetition basis does not match the .std "
-                                    "dimensions — the record likely predates the "
-                                    "2026-04-04 OSS convention change (33bbc70); "
+                                    "dimensions — the record may use a historical "
+                                    "convention (pre-2026-04-04) or a degenerate "
+                                    "special case; "
                                     "re-benchmark this instance",
                                 )
                                 continue
@@ -469,6 +475,7 @@ def refresh_benchmark_counts(
         f"Refreshed {refreshed} variant records; already current: {already_current}; "
         f"anomalies: {anomaly_count}."
     )
+    return anomaly_count
 
 
 if __name__ == "__main__":
@@ -507,7 +514,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--refresh-counts",
         action="store_true",
-        help="Correct legacy cycle totals and backfill the query/repetition breakdown without benchmarking.",
+        help="Correct legacy cycle totals and backfill the query/repetition breakdown without benchmarking; exits nonzero on anomalies.",
     )
     args = parser.parse_args()
     if args.show:
@@ -523,11 +530,13 @@ if __name__ == "__main__":
             variant=args.variant,
         )
     elif args.refresh_counts:
-        refresh_benchmark_counts(
+        anomaly_count = refresh_benchmark_counts(
             instance_classes=args.instance_classes or None,
             cache_dir=args.cache_dir,
             variant=args.variant,
         )
+        if anomaly_count:
+            sys.exit(1)
     else:
         benchmark_all_instance_classes(
             instance_classes=args.instance_classes or None,

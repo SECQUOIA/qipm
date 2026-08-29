@@ -22,12 +22,12 @@ from standard_form import _HIGHS_INF, load_standard_form
 
 from store import (
     SOLVE_RESULT_KEYS,
-    count_successful_records,
     list_class_names,
     list_instance_dirs,
     merge_ledger,
     process_instance_dirs,
     resolve_cache_root,
+    summarize_records,
 )
 
 SOLVE_TIMEOUT = 600.0  # 10 minutes per file
@@ -206,6 +206,8 @@ def solve_instance(
             mps_timed_out = True
 
     if format == "both" and mps_timed_out:
+        for p in std_paths:
+            _merge_solve_result(p, "skipped_mps_timeout")
         return
 
     for p in std_paths:
@@ -263,6 +265,7 @@ def solve_all_instance_classes(
 
     for name in instance_classes:
         solve_instance_class(name, root, format=format)
+        show_solve_status([name], format=format, cache_dir=root)
 
 
 def show_solve_status(
@@ -292,8 +295,8 @@ def show_solve_status(
 
         subdirs = list_instance_dirs(folder)
         total = len(subdirs)
-        counts = {
-            fmt: count_successful_records(
+        summaries = {
+            fmt: summarize_records(
                 subdirs,
                 value_key=SOLVE_RESULT_KEYS[fmt][0],
                 status_key=SOLVE_RESULT_KEYS[fmt][1],
@@ -302,7 +305,15 @@ def show_solve_status(
             for fmt in active_formats
         }
 
-        parts = "  ".join(f"{fmt}: {counts[fmt]}/{total}" for fmt in active_formats)
+        parts = []
+        for fmt in active_formats:
+            count, non_ok = summaries[fmt]
+            breakdown = ", ".join(
+                f"{status}: {number}" for status, number in sorted(non_ok.items())
+            )
+            suffix = f" ({breakdown})" if breakdown else ""
+            parts.append(f"{fmt}: {count}/{total}{suffix}")
+        parts = "  ".join(parts)
         print(f"{cls}:  {parts}")
 
 

@@ -23,6 +23,7 @@ from store import (
     process_instance_dirs,
     purge_keys_from_ledger,
     resolve_cache_root,
+    summarize_records,
 )
 
 
@@ -40,8 +41,8 @@ def _purge_downstream_data(path: Path) -> None:
 
 
 def _withhold_standard_form(path: Path, status: str) -> None:
-    _merge_transform_status(path, status, retract=True)
     path.with_suffix(".std").unlink(missing_ok=True)
+    _merge_transform_status(path, status, retract=True)
 
 
 def _transform_instance_impl(path: Path) -> bool | None:
@@ -218,7 +219,7 @@ def show_transform_status(
     instance_classes: list[str] | None = None,
     cache_dir: str | Path | None = None,
 ) -> None:
-    """Print how many instances per class have a .std file.
+    """Print how many instances per class have a successful transform status.
 
     For each instance class, prints "<class>: x/total".
     """
@@ -237,8 +238,17 @@ def show_transform_status(
 
         subdirs = list_instance_dirs(folder)
         total = len(subdirs)
-        done = sum(1 for d in subdirs if any(d.glob("*.std")))
-        print(f"{cls}: {done}/{total}")
+        done, non_ok = summarize_records(
+            subdirs,
+            value_key=TRANSFORM_STATUS_KEY,
+            status_key=TRANSFORM_STATUS_KEY,
+            ok_statuses=("ok",),
+        )
+        breakdown = ", ".join(
+            f"{status}: {number}" for status, number in sorted(non_ok.items())
+        )
+        suffix = f" ({breakdown})" if breakdown else ""
+        print(f"{cls}: {done}/{total}{suffix}")
 
 
 def clear_std_files(
@@ -287,7 +297,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--show",
         action="store_true",
-        help="Show how many instances per class have a .std file. Other flags are ignored.",
+        help="Show successful transform counts and non-ok statuses by class. Other flags are ignored.",
     )
     args = parser.parse_args()
     if args.show:

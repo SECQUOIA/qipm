@@ -10,6 +10,7 @@ import pytest
 from scipy.sparse import csr_matrix
 
 import standard_form
+import solve
 from solve import (
     HIGHS_THREADS,
     HIGHS_VERSION,
@@ -188,7 +189,35 @@ def test_show_solve_status_accepts_ok_ipm_and_unhashable_status(
         (instance_dir / f"{name}.data").write_text(json.dumps(data))
 
     show_solve_status(["cls"], format="std", cache_dir=tmp_path)
-    assert "std: 1/2" in capsys.readouterr().out
+    assert "std: 1/2 (malformed: 1)" in capsys.readouterr().out
+
+
+def test_both_mode_mps_timeout_retracts_std_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance_dir = tmp_path / "cls" / "item"
+    instance_dir.mkdir(parents=True)
+    mps_path = instance_dir / "item.mps"
+    std_path = instance_dir / "item.std"
+    mps_path.write_text("unused")
+    std_path.write_text("unused")
+    (instance_dir / "item.data").write_text(json.dumps({
+        "runtime_highs_std": 12.5,
+        "solve_status_std": "ok",
+    }))
+    calls = []
+
+    def fake_solve(path: Path) -> str:
+        calls.append(path)
+        return "timeout"
+
+    monkeypatch.setattr(solve, "_solve_with_timeout", fake_solve)
+    solve_instance("cls", "item", cache_dir=tmp_path, format="both")
+
+    data = json.loads((instance_dir / "item.data").read_text())
+    assert calls == [mps_path]
+    assert data["solve_status_std"] == "skipped_mps_timeout"
+    assert "runtime_highs_std" not in data
 
 
 def test_fresh_solve_ledger_writes_runtime_before_status(tmp_path: Path) -> None:

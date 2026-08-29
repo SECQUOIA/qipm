@@ -145,7 +145,7 @@ def _write_data_files_from_evaluation(clone_path: Path, cache_path: Path) -> Non
                             continue
                         try:
                             data = json.loads(zf.read(info.filename).decode())
-                        except (json.JSONDecodeError, UnicodeDecodeError):
+                        except (ValueError, UnicodeDecodeError):
                             continue
                         runtime_primal = data.get("runtime_primal")
                         file_path = data.get("file_path")

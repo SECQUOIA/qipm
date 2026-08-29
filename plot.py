@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -66,8 +67,17 @@ _RCPARAMS = {
 def _finite_number(value: object, *, positive: bool = False) -> bool:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False
+    if isinstance(value, int):
+        return value > 0 if positive else value >= 0
     numeric = float(value)
     return math.isfinite(numeric) and (numeric > 0 if positive else numeric >= 0)
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value)
+    except OverflowError:
+        return math.inf
 
 
 def _difficulty_bins(values: np.ndarray) -> np.ndarray:
@@ -137,7 +147,9 @@ def _cycle_counts(records: list[dict], variant: str) -> np.ndarray | None:
     """Extract cycle counts for a single variant ('mnes' or 'oss')."""
     key = BENCHMARK_VALUE_KEYS[variant].count
     vals = [r[key] for r in records if _finite_number(r.get(key), positive=True)]
-    return np.array(vals, dtype=np.float64) if vals else None
+    if not vals:
+        return None
+    return np.array([_as_float(value) for value in vals], dtype=np.float64)
 
 
 def _crossover_times(cycle_counts: np.ndarray, runtimes: np.ndarray) -> np.ndarray:
@@ -160,8 +172,12 @@ def _advantage_pairs(
             ]
             if pairs:
                 class_pairs[variant] = (
-                    np.array([count for count, _ in pairs], dtype=np.float64),
-                    np.array([runtime for _, runtime in pairs], dtype=np.float64),
+                    np.array(
+                        [_as_float(count) for count, _ in pairs], dtype=np.float64
+                    ),
+                    np.array(
+                        [_as_float(runtime) for _, runtime in pairs], dtype=np.float64
+                    ),
                 )
         if class_pairs:
             result[cls] = class_pairs
@@ -329,7 +345,7 @@ def _load_difficulty_data(
             k = r.get(keys.cond)
             if not _finite_number(s, positive=True) or not _finite_number(k, positive=True):
                 continue
-            product = float(s) * float(k)
+            product = _as_float(s) * _as_float(k)
             if math.isfinite(product) and product > 0:
                 values.append(product)
         if values:
@@ -445,7 +461,12 @@ def _load_ratio_data(
     variants = list(VARIANTS) if variants is None else variants
     all_records = _iter_records(instance_classes, cache_dir)
     loaded: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
-    skipped = {"missing_runtime": 0, "invalid_runtime": 0, "needs_refresh": 0}
+    skipped = {
+        "missing_runtime": 0,
+        "invalid_runtime": 0,
+        "needs_refresh": 0,
+        "unplottable_overflow": 0,
+    }
     eligible_instances = 0
 
     for cls, records in all_records.items():
@@ -490,9 +511,21 @@ def _load_ratio_data(
                 try:
                     total_ratio = cycle_time * count / runtime
                     prep_ratio = cycle_time * queries / runtime
-                except (OverflowError, TypeError, ZeroDivisionError):
+                except OverflowError:
+                    try:
+                        total_ratio = float(
+                            Fraction(count) * Fraction(cycle_time) / Fraction(runtime)
+                        )
+                        prep_ratio = float(
+                            Fraction(queries) * Fraction(cycle_time) / Fraction(runtime)
+                        )
+                    except OverflowError:
+                        skipped["unplottable_overflow"] += 1
+                        continue
+                except (TypeError, ZeroDivisionError):
                     continue
                 if not math.isfinite(total_ratio) or not math.isfinite(prep_ratio):
+                    skipped["unplottable_overflow"] += 1
                     continue
                 total_values, prep_values = class_values[variant]
                 total_values.append(total_ratio)
@@ -554,7 +587,8 @@ def plot_ratio(
         f"Ratio data: {skipped['missing_runtime']} records missing the runtime key; "
         f"{skipped['invalid_runtime']} records with non-positive or non-finite runtime; "
         f"{skipped['needs_refresh']} variant records need "
-        "benchmark.py --refresh-counts."
+        "benchmark.py --refresh-counts; "
+        f"{skipped['unplottable_overflow']} variant records overflow plotting."
     )
     if not data:
         print("No ratio data found.")
@@ -583,11 +617,19 @@ def plot_ratio(
             prep = [data[cls][active][1] for cls in available]
             total_boxes = ax.boxplot(
                 total, positions=positions - 0.18, widths=0.32, patch_artist=True,
-                manage_ticks=False, showfliers=False,
+                manage_ticks=False,
+                flierprops=dict(
+                    marker=".", markersize=2, markerfacecolor="#555555",
+                    markeredgecolor="none", alpha=0.35,
+                ),
             )
             prep_boxes = ax.boxplot(
                 prep, positions=positions + 0.18, widths=0.32, patch_artist=True,
-                manage_ticks=False, showfliers=False,
+                manage_ticks=False,
+                flierprops=dict(
+                    marker=".", markersize=2, markerfacecolor="#555555",
+                    markeredgecolor="none", alpha=0.35,
+                ),
             )
             for patch, cls in zip(total_boxes["boxes"], available):
                 patch.set_facecolor(class_colors[cls])

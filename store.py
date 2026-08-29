@@ -6,6 +6,7 @@ import json
 import math
 import os
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -20,6 +21,7 @@ class BenchmarkValueKeys(NamedTuple):
     count: str
     sparsity: str
     cond: str
+    cond_method: str
     qlsa_queries: str
     tomography_reps: str
 
@@ -34,6 +36,7 @@ BENCHMARK_VALUE_KEYS = {
         f"cycle_count_{variant}",
         f"sparsity_{variant}",
         f"cond_{variant}",
+        f"cond_method_{variant}",
         f"qlsa_queries_{variant}",
         f"tomography_reps_{variant}",
     )
@@ -89,7 +92,7 @@ def read_ledger(path: Path) -> tuple[dict[str, Any], LedgerState]:
         return {}, "missing"
     try:
         data = json.loads(path.read_text())
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError):
         return {}, "invalid"
     if not isinstance(data, dict):
         return {}, "invalid"
@@ -172,25 +175,44 @@ def process_instance_dirs(
             tqdm.write(f"skipping {instance_dir.name}: {exc}")
 
 
-def count_successful_records(
+def stored_finite_number(value: object) -> bool:
+    """Return whether a stored int or float is finite, excluding booleans."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def summarize_records(
     instance_dirs: Iterable[Path],
     *,
     value_key: str,
     status_key: str,
     ok_statuses: Iterable[str],
-) -> int:
-    """Count explicit successful statuses, with finite legacy-value fallback."""
+) -> tuple[int, Counter[str]]:
+    """Summarize successful statuses and label all other records."""
     ok_statuses = tuple(ok_statuses)
     count = 0
+    non_ok: Counter[str] = Counter()
     for instance_dir in instance_dirs:
-        data_files = list(instance_dir.glob("*.data"))
-        data, _ = read_ledger(data_files[0]) if data_files else ({}, "missing")
+        data_files = sorted(instance_dir.glob("*.data"))
+        data, state = read_ledger(data_files[0]) if data_files else ({}, "missing")
+        if state == "invalid":
+            non_ok["invalid"] += 1
+            continue
         value = data.get(value_key)
         legacy_done = (
             status_key not in data
-            and isinstance(value, (int, float))
-            and math.isfinite(value)
+            and stored_finite_number(value)
         )
-        if data.get(status_key) in ok_statuses or legacy_done:
+        status = data.get(status_key)
+        if (isinstance(status, str) and status in ok_statuses) or legacy_done:
             count += 1
-    return count
+        elif status_key not in data:
+            non_ok["absent"] += 1
+        elif isinstance(status, str):
+            non_ok[status] += 1
+        else:
+            non_ok["malformed"] += 1
+    return count, non_ok

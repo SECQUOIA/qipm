@@ -18,6 +18,7 @@ from standard_form import (
 )
 from transform import (
     clear_std_files,
+    show_transform_status,
     transform_instance,
 )
 
@@ -27,12 +28,14 @@ DOWNSTREAM_DATA = {
     "cycle_count_mnes": 10,
     "sparsity_mnes": 2,
     "cond_mnes": 3.0,
+    "cond_method_mnes": "svds",
     "qlsa_queries_mnes": 5,
     "tomography_reps_mnes": 2,
     "status_mnes": "ok",
     "cycle_count_oss": 20,
     "sparsity_oss": 4,
     "cond_oss": 5.0,
+    "cond_method_oss": "probe_sigma_min",
     "qlsa_queries_oss": 4,
     "tomography_reps_oss": 5,
     "status_oss": "ok",
@@ -315,6 +318,49 @@ def test_clear_std_files_purges_downstream_data(tmp_path: Path) -> None:
     assert json.loads(data_path.read_text()) == SURVIVING_DATA
     assert not (corrupt_dir / "corrupt.std").exists()
     assert json.loads(corrupt_data.read_text()) == {}
+
+
+def test_show_transform_status_uses_status_not_std_presence(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    records = {
+        "ok": {"transform_status": "ok"},
+        "empty": {"transform_status": "reduced_to_empty"},
+        "error": {"transform_status": "error:RuntimeError"},
+        "absent": {},
+        "invalid": None,
+    }
+    for name, record in records.items():
+        instance_dir = tmp_path / "cls" / name
+        instance_dir.mkdir(parents=True)
+        content = "not json" if record is None else json.dumps(record)
+        (instance_dir / f"{name}.data").write_text(content)
+    (tmp_path / "cls" / "empty" / "empty.std").write_bytes(b"stale")
+
+    show_transform_status(["cls"], cache_dir=tmp_path)
+
+    assert (
+        "cls: 1/5 (absent: 1, error:RuntimeError: 1, invalid: 1, "
+        "reduced_to_empty: 1)"
+        in capsys.readouterr().out
+    )
+
+
+def test_withhold_unlinks_std_before_ledger_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mps_path = tmp_path / "item.mps"
+    std_path = tmp_path / "item.std"
+    std_path.write_bytes(b"stale")
+
+    def fail_merge(*args, **kwargs) -> None:
+        assert not std_path.exists()
+        raise OSError("write failed")
+
+    monkeypatch.setattr(transform, "_merge_transform_status", fail_merge)
+    with pytest.raises(OSError, match="write failed"):
+        transform._withhold_standard_form(mps_path, "error:RuntimeError")
+    assert not std_path.exists()
 
 
 def test_clear_std_files_interleaves_purge_and_unlink_by_instance(

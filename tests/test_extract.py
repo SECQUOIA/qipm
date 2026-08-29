@@ -33,6 +33,11 @@ def test_evaluation_merge_preserves_existing_data(tmp_path: Path) -> None:
                 {"runtime_primal": 3.5, "file_path": "mps/netlib/min/bar.mps"}
             ),
         )
+        output.writestr(
+            "huge.data",
+            '{"runtime_primal":' + "1" * 5000
+            + ',"file_path":"mps/netlib/min/huge.mps"}',
+        )
 
     cache = tmp_path / "cache"
     instance_dir = cache / "netlib" / "foo"
@@ -54,6 +59,7 @@ def test_evaluation_merge_preserves_existing_data(tmp_path: Path) -> None:
     assert json.loads((cache / "netlib" / "bar" / "bar.data").read_text()) == {
         "runtime_glpk": 3.5
     }
+    assert not (cache / "netlib" / "huge").exists()
 
 
 def test_containment_guard_rejects_escape(tmp_path: Path) -> None:

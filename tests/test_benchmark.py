@@ -31,6 +31,7 @@ from bounds import (
     cycle_count_qlsa,
 )
 from standard_form import load_standard_form, write_standard_form
+from store import read_ledger
 
 
 def _write_std(path: Path, A: np.ndarray) -> None:
@@ -69,19 +70,55 @@ def test_handcrafted_standard_form_layout_remains_compatible(tmp_path: Path) -> 
     assert obj_offset == 0.0
 
 
+def test_read_ledger_treats_oversized_integer_literal_as_invalid(tmp_path: Path) -> None:
+    data_path = tmp_path / "huge.data"
+    data_path.write_text('{"value":' + "1" * 5000 + "}")
+    assert read_ledger(data_path) == ({}, "invalid")
+
+
 @pytest.mark.parametrize(("s", "k", "expected"), [(1, 1.0, 48), (2, 1.0, 112)])
 def test_cycle_count_exact(s: int, k: float, expected: int) -> None:
     assert cycle_count_qlsa(s=s, k=k) == expected
 
 
-def test_cycle_count_monotone_and_guards_overflow() -> None:
+def test_cycle_count_monotone_and_total_domain() -> None:
     base = cycle_count_qlsa(s=2, k=2.0)
     assert cycle_count_qlsa(s=3, k=2.0) > base
     assert cycle_count_qlsa(s=2, k=3.0) > base
-    with pytest.raises((OverflowError, ValueError, ArithmeticError)):
-        cycle_count_qlsa(s=2, k=1e308)
+    counts = [cycle_count_qlsa(s=2, k=k) for k in (1e150, 1e152, 1e308)]
+    assert counts[0] < counts[1] < counts[2]
+    assert cycle_count_qlsa(s=2, k=1e308) == counts[2]
+
+
+@pytest.mark.parametrize("k", [math.inf, math.nan, 0.5])
+def test_cycle_count_rejects_invalid_condition(k: float) -> None:
     with pytest.raises(ValueError):
-        cycle_count_qlsa(s=1, k=math.inf)
+        cycle_count_qlsa(s=1, k=k)
+
+
+def test_cycle_count_rejects_nonpositive_s() -> None:
+    with pytest.raises(ValueError):
+        cycle_count_qlsa(s=0, k=1.0)
+
+
+@pytest.mark.parametrize(
+    ("k", "expected"),
+    [
+        (
+            1e152,
+            "1156643368607391726922799121359002874832769270854683260497779543522460828168011845615410214885352995319089624375215206543922913056505313811337571739967270136",
+        ),
+        (
+            1e308,
+            "2329818942515642034590609445500944842331756808055407363830729637541832829450180033369891970399533381494251808380482478564957076520176979476103360344748718452983668529229329003743592304976338622731824286482241473055674327997466348202046124783743324073039694052880167436183769848291314198630171785954173573537860192",
+        ),
+    ],
+)
+def test_cycle_count_big_domain_regressions(k: float, expected: str) -> None:
+    result = cycle_count_qlsa(s=2, k=k)
+    reference = int(expected)
+    assert type(result) is int
+    assert abs(result - reference) / reference <= 1e-12
 
 
 @pytest.mark.parametrize(
@@ -130,10 +167,12 @@ def test_mnes_production_fallback_probes_wide_fbar_on_left(monkeypatch) -> None:
     basis = _preprocess_basis(A)
     assert basis.n_N > basis.m
     monkeypatch.setattr(bounds, "_sigma_timed", lambda *args: None)
-    reported_k = _cycle_count_mnes_from_basis(basis).cond
+    result = _cycle_count_mnes_from_basis(basis)
+    reported_k = result.cond
     F = basis.A_B_lu.solve(basis.A_N.toarray())
     true_k = np.linalg.cond(np.eye(basis.m) + F @ F.T)
     assert reported_k <= true_k * (1 + 1e-8)
+    assert result.cond_method == "probe_both"
 
 
 def test_empty_nonbasic_partition_uses_exact_shortcuts() -> None:
@@ -145,6 +184,7 @@ def test_empty_nonbasic_partition_uses_exact_shortcuts() -> None:
     s_mnes, k_mnes = mnes.sparsity, mnes.cond
     s_oss = oss.sparsity
     assert (s_mnes, k_mnes) == (1, 1.0)
+    assert mnes.cond_method == "exact"
     assert s_oss == 2
 
 
@@ -320,6 +360,9 @@ def test_benchmark_both_records_success(tmp_path: Path) -> None:
         assert data[f"status_{variant}"] == "ok"
         assert data[f"cycle_count_{variant}"] > 0
         assert data[f"cond_{variant}"] >= 1.0
+        assert data[f"cond_method_{variant}"] in {
+            "exact", "svds", "probe_sigma_max", "probe_sigma_min", "probe_both"
+        }
         assert type(data[f"qlsa_queries_{variant}"]) is int
         assert type(data[f"tomography_reps_{variant}"]) is int
         assert type(data[f"cycle_count_{variant}"]) is int
@@ -339,7 +382,7 @@ def test_both_mode_preserves_mnes_when_oss_fails(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(
         benchmark,
         "_cycle_count_mnes_from_basis",
-        lambda basis: CycleCountResult(100, 2, 0.9, 25, 4),
+        lambda basis: CycleCountResult(100, 2, 0.9, "exact", 25, 4),
     )
 
     def _fail(basis):
@@ -351,10 +394,12 @@ def test_both_mode_preserves_mnes_when_oss_fails(tmp_path: Path, monkeypatch) ->
     assert data["status_mnes"] == "ok"
     assert data["cycle_count_mnes"] == 100
     assert data["cond_mnes"] == 1.0
+    assert data["cond_method_mnes"] == "exact"
     assert data["qlsa_queries_mnes"] == 25
     assert data["tomography_reps_mnes"] == 4
     assert data["status_oss"] == "error:OverflowError"
     assert data["cycle_count_oss"] is None
+    assert data["cond_method_oss"] is None
     assert data["qlsa_queries_oss"] is None
     assert data["tomography_reps_oss"] is None
 
@@ -375,7 +420,7 @@ def test_show_and_clear_use_status_with_legacy_fallback(tmp_path: Path, capsys) 
         instance_dir.mkdir(parents=True)
         (instance_dir / f"{name}.data").write_text(json.dumps(data))
     show_benchmark_status(["cls"], variant="mnes", cache_dir=tmp_path)
-    assert "mnes: 2/4" in capsys.readouterr().out
+    assert "mnes: 2/4 (absent: 1, timeout: 1)" in capsys.readouterr().out
     clear_benchmark_data(["cls"], cache_dir=tmp_path, variant="mnes")
     for data_path in (tmp_path / "cls").rglob("*.data"):
         data = json.loads(data_path.read_text())
@@ -383,6 +428,18 @@ def test_show_and_clear_use_status_with_legacy_fallback(tmp_path: Path, capsys) 
         assert "cycle_count_mnes" not in data
         assert "qlsa_queries_mnes" not in data
         assert "tomography_reps_mnes" not in data
+
+
+def test_show_accepts_huge_legacy_integer_without_float_conversion(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "huge"
+    instance_dir.mkdir(parents=True)
+    (instance_dir / "huge.data").write_text(
+        json.dumps({"cycle_count_mnes": 10**1000})
+    )
+    show_benchmark_status(["cls"], variant="mnes", cache_dir=tmp_path)
+    assert "mnes: 1/1" in capsys.readouterr().out
 
 
 def test_refresh_counts_migrates_exact_product_record_and_is_idempotent(
