@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qipm"
 version = "0.1.0"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "highspy>=1.7.0",
     "matplotlib>=3.5.0",

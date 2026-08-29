@@ -22,8 +22,9 @@ dist/
 .cursor/
 .claude/
 
-# Claude Code
+# Agent instructions (machine-specific, local only)
 CLAUDE.md
+AGENTS.md
 *.swp
 *.swo
 
