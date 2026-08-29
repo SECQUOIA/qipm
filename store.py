@@ -8,12 +8,21 @@ import os
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 from tqdm import tqdm
 
 VARIANTS = ("mnes", "oss")
+
+
+class BenchmarkValueKeys(NamedTuple):
+    count: str
+    sparsity: str
+    cond: str
+    qlsa_queries: str
+    tomography_reps: str
+
 
 TRANSFORM_STATUS_KEY = "transform_status"
 SOLVE_RESULT_KEYS = {
@@ -21,10 +30,12 @@ SOLVE_RESULT_KEYS = {
     "std": ("runtime_highs_std", "solve_status_std"),
 }
 BENCHMARK_VALUE_KEYS = {
-    variant: (
+    variant: BenchmarkValueKeys(
         f"cycle_count_{variant}",
         f"sparsity_{variant}",
         f"cond_{variant}",
+        f"qlsa_queries_{variant}",
+        f"tomography_reps_{variant}",
     )
     for variant in VARIANTS
 }

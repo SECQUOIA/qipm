@@ -27,10 +27,14 @@ DOWNSTREAM_DATA = {
     "cycle_count_mnes": 10,
     "sparsity_mnes": 2,
     "cond_mnes": 3.0,
+    "qlsa_queries_mnes": 5,
+    "tomography_reps_mnes": 2,
     "status_mnes": "ok",
     "cycle_count_oss": 20,
     "sparsity_oss": 4,
     "cond_oss": 5.0,
+    "qlsa_queries_oss": 4,
+    "tomography_reps_oss": 5,
     "status_oss": "ok",
     "runtime_highs_std": 0.1,
     "solve_status_std": "ok",
@@ -39,6 +43,8 @@ SURVIVING_DATA = {
     "runtime_glpk": 1.0,
     "runtime_highs_mps": 0.2,
     "solve_status_mps": "ok",
+    "highs_version": "1.15.1",
+    "highs_threads": 1,
 }
 
 

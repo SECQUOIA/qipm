@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot quantum advantage curves and difficulty (s·κ) histograms from benchmark data."""
+"""Plot quantum advantage, fixed-cycle ratios, and difficulty from benchmark data."""
 
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ from store import (
     resolve_cache_root,
 )
 
-GATE_SPEED_RECORD = 8e-10  # seconds — update as needed
+# 800 ps √SWAP two-qubit gate, He et al., Nature 571, 371 (2019); Sec. V
+# of the paper uses it as an optimistic physical proxy for a logical cycle.
+DEFAULT_CYCLE_DURATION = 8e-10
 N_POINTS = 500
 N_BINS = 30
 
@@ -122,8 +124,8 @@ def _load_advantage_data(
             r for r in records
             if _finite_number(r.get(runtime_key))
             and (
-                _finite_number(r.get(BENCHMARK_VALUE_KEYS["mnes"][0]), positive=True)
-                or _finite_number(r.get(BENCHMARK_VALUE_KEYS["oss"][0]), positive=True)
+                _finite_number(r.get(BENCHMARK_VALUE_KEYS["mnes"].count), positive=True)
+                or _finite_number(r.get(BENCHMARK_VALUE_KEYS["oss"].count), positive=True)
             )
         ]
         if filtered:
@@ -133,7 +135,7 @@ def _load_advantage_data(
 
 def _cycle_counts(records: list[dict], variant: str) -> np.ndarray | None:
     """Extract cycle counts for a single variant ('mnes' or 'oss')."""
-    key = BENCHMARK_VALUE_KEYS[variant][0]
+    key = BENCHMARK_VALUE_KEYS[variant].count
     vals = [r[key] for r in records if _finite_number(r.get(key), positive=True)]
     return np.array(vals, dtype=np.float64) if vals else None
 
@@ -150,7 +152,7 @@ def _advantage_pairs(
     for cls, records in data.items():
         class_pairs = {}
         for variant in variants:
-            key = BENCHMARK_VALUE_KEYS[variant][0]
+            key = BENCHMARK_VALUE_KEYS[variant].count
             pairs = [
                 (record[key], record[runtime_key])
                 for record in records
@@ -185,7 +187,7 @@ def plot_advantage(
     variant: str,
     cache_dir: Path,
     output: Path,
-    runtime_key: str = "runtime_glpk",
+    runtime_key: str = SOLVE_RESULT_KEYS["std"][0],
 ) -> None:
     """Plot advantage curves. variant: 'mnes', 'oss', or 'both'."""
     data = _load_advantage_data(instance_classes, cache_dir, runtime_key)
@@ -200,8 +202,8 @@ def plot_advantage(
             selected = [
                 record
                 for record in records
-                if _finite_number(record.get(BENCHMARK_VALUE_KEYS["mnes"][0]), positive=True)
-                and _finite_number(record.get(BENCHMARK_VALUE_KEYS["oss"][0]), positive=True)
+                if _finite_number(record.get(BENCHMARK_VALUE_KEYS["mnes"].count), positive=True)
+                and _finite_number(record.get(BENCHMARK_VALUE_KEYS["oss"].count), positive=True)
             ]
             if selected:
                 complete[cls] = selected
@@ -225,7 +227,7 @@ def plot_advantage(
         return
     positive = combined[combined > 0]
     x_min = max(1e-28, float(positive.min())) if positive.size else 1e-28
-    x_max = max(float(combined.max()), GATE_SPEED_RECORD) * 10
+    x_max = max(float(combined.max()), DEFAULT_CYCLE_DURATION) * 10
     t_values = np.geomspace(x_min, x_max, N_POINTS)
 
     plt.rcParams.update({
@@ -258,9 +260,9 @@ def plot_advantage(
             tv, cv = _truncate_at_zero(t_values, curve)
             ax.plot(tv, cv, color=color, linestyle=linestyles[v], linewidth=1.8)
 
-    ax.axvline(GATE_SPEED_RECORD, color="#444444", linestyle=":", linewidth=1.2)
+    ax.axvline(DEFAULT_CYCLE_DURATION, color="#444444", linestyle=":", linewidth=1.2)
     ax.text(
-        GATE_SPEED_RECORD * 0.82, 50,
+        DEFAULT_CYCLE_DURATION * 0.82, 50,
         "current speed record for\n an entangling gate operation",
         ha="right", va="center", fontsize=8.5, rotation=90, color="#444444",
     )
@@ -317,14 +319,14 @@ def _load_difficulty_data(
     variant: str,
 ) -> dict[str, np.ndarray]:
     """Load s·κ products for each class for the given variant ('mnes' or 'oss')."""
-    _, sparsity_key, cond_key = BENCHMARK_VALUE_KEYS[variant]
+    keys = BENCHMARK_VALUE_KEYS[variant]
     all_records = _iter_records(instance_classes, cache_dir)
     result: dict[str, np.ndarray] = {}
     for cls, records in all_records.items():
         values = []
         for r in records:
-            s = r.get(sparsity_key)
-            k = r.get(cond_key)
+            s = r.get(keys.sparsity)
+            k = r.get(keys.cond)
             if not _finite_number(s, positive=True) or not _finite_number(k, positive=True):
                 continue
             product = float(s) * float(k)
@@ -399,6 +401,264 @@ def plot_difficulty(
 
 
 # ---------------------------------------------------------------------------
+# Fixed-cycle-time ratio plot
+# ---------------------------------------------------------------------------
+
+def _validate_cycle_time(value: float) -> float:
+    cycle_time = float(value)
+    if not math.isfinite(cycle_time) or cycle_time <= 0:
+        raise ValueError("cycle time must be positive and finite")
+    return cycle_time
+
+
+def _stored_integer(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, float) or not math.isfinite(value) or not value.is_integer():
+        return None
+    return int(value)
+
+
+def _positive_stored_number(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value > 0
+    return isinstance(value, float) and math.isfinite(value) and value > 0
+
+
+def _load_ratio_data(
+    instance_classes: list[str],
+    cache_dir: Path,
+    runtime_key: str,
+    cycle_time: float,
+    variants: list[str] | None = None,
+) -> tuple[
+    dict[str, dict[str, tuple[np.ndarray, np.ndarray]]],
+    dict[str, int],
+    int,
+]:
+    """Load aligned (total, one-preparation) ratios and skip statistics."""
+    cycle_time = _validate_cycle_time(cycle_time)
+    variants = list(VARIANTS) if variants is None else variants
+    all_records = _iter_records(instance_classes, cache_dir)
+    loaded: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+    skipped = {"missing_runtime": 0, "invalid_runtime": 0, "needs_refresh": 0}
+    eligible_instances = 0
+
+    for cls, records in all_records.items():
+        class_values: dict[str, tuple[list[float], list[float]]] = {
+            variant: ([], []) for variant in variants
+        }
+        for record in records:
+            eligible_variants = [
+                variant
+                for variant in variants
+                if _positive_stored_number(
+                    record.get(BENCHMARK_VALUE_KEYS[variant].count)
+                )
+            ]
+            if not eligible_variants:
+                continue
+            if runtime_key not in record:
+                skipped["missing_runtime"] += 1
+                continue
+            runtime = record[runtime_key]
+            if not _positive_stored_number(runtime):
+                skipped["invalid_runtime"] += 1
+                continue
+            record_eligible = False
+            for variant in eligible_variants:
+                keys = BENCHMARK_VALUE_KEYS[variant]
+                raw_count = record.get(keys.count)
+                count = _stored_integer(raw_count)
+                queries = _stored_integer(record.get(keys.qlsa_queries))
+                repetitions = _stored_integer(record.get(keys.tomography_reps))
+                if (
+                    count is None
+                    or queries is None
+                    or repetitions is None
+                    or count <= 0
+                    or queries <= 0
+                    or repetitions <= 0
+                    or count != queries * repetitions
+                ):
+                    skipped["needs_refresh"] += 1
+                    continue
+                try:
+                    total_ratio = cycle_time * count / runtime
+                    prep_ratio = cycle_time * queries / runtime
+                except (OverflowError, TypeError, ZeroDivisionError):
+                    continue
+                if not math.isfinite(total_ratio) or not math.isfinite(prep_ratio):
+                    continue
+                total_values, prep_values = class_values[variant]
+                total_values.append(total_ratio)
+                prep_values.append(prep_ratio)
+                record_eligible = True
+            if record_eligible:
+                eligible_instances += 1
+
+        class_data = {
+            variant: (
+                np.array(total_values, dtype=np.float64),
+                np.array(prep_values, dtype=np.float64),
+            )
+            for variant, (total_values, prep_values) in class_values.items()
+            if total_values
+        }
+        if class_data:
+            loaded[cls] = class_data
+    return loaded, skipped, eligible_instances
+
+
+def _ecdf(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    ordered = np.sort(values)
+    start = np.nextafter(ordered[0], 0.0)
+    if start <= 0:
+        start = ordered[0]
+    x_values = np.concatenate(([start], ordered))
+    percentages = 100.0 * np.arange(len(ordered) + 1) / len(ordered)
+    return x_values, percentages
+
+
+def _cycle_duration_label(seconds: float) -> str:
+    if seconds < 1e-9:
+        return f"{seconds * 1e12:g} ps"
+    if seconds < 1e-6:
+        return f"{seconds * 1e9:g} ns"
+    return f"{seconds:g} s"
+
+
+def plot_ratio(
+    instance_classes: list[str],
+    cache_dir: Path,
+    output: Path,
+    *,
+    runtime_key: str,
+    baseline_label: str,
+    cycle_time: float = DEFAULT_CYCLE_DURATION,
+    style: str = "box",
+    variant: str = "both",
+) -> None:
+    """Plot fixed-cycle quantum/classical runtime ratios."""
+    if style not in ("box", "ecdf"):
+        raise ValueError("ratio style must be 'box' or 'ecdf'")
+    variants = list(VARIANTS) if variant == "both" else [variant]
+    data, skipped, eligible = _load_ratio_data(
+        instance_classes, cache_dir, runtime_key, cycle_time, variants
+    )
+    print(
+        f"Ratio data: {skipped['missing_runtime']} records missing the runtime key; "
+        f"{skipped['invalid_runtime']} records with non-positive or non-finite runtime; "
+        f"{skipped['needs_refresh']} variant records need "
+        "benchmark.py --refresh-counts."
+    )
+    if not data:
+        print("No ratio data found.")
+        return
+
+    plt.rcParams.update(_RCPARAMS)
+    fig, axes = plt.subplots(
+        1, len(variants), figsize=(6 * len(variants), 4.6), sharey=True, squeeze=False
+    )
+    fallback_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    classes = sorted(data, key=str.lower)
+    class_colors = {
+        cls: CLASS_COLORS.get(cls, fallback_colors[i % len(fallback_colors)])
+        for i, cls in enumerate(classes)
+    }
+
+    for ax, active in zip(axes[0], variants):
+        available = [cls for cls in classes if active in data[cls]]
+        if not available:
+            ax.text(0.5, 0.5, "No eligible data", transform=ax.transAxes, ha="center")
+            ax.set_title(active.upper())
+            continue
+        if style == "box":
+            positions = np.arange(len(available), dtype=float)
+            total = [data[cls][active][0] for cls in available]
+            prep = [data[cls][active][1] for cls in available]
+            total_boxes = ax.boxplot(
+                total, positions=positions - 0.18, widths=0.32, patch_artist=True,
+                manage_ticks=False, showfliers=False,
+            )
+            prep_boxes = ax.boxplot(
+                prep, positions=positions + 0.18, widths=0.32, patch_artist=True,
+                manage_ticks=False, showfliers=False,
+            )
+            for patch, cls in zip(total_boxes["boxes"], available):
+                patch.set_facecolor(class_colors[cls])
+            for patch, cls in zip(prep_boxes["boxes"], available):
+                patch.set_facecolor(class_colors[cls])
+                patch.set_alpha(0.3)
+                patch.set_hatch("///")
+            ax.set_xticks(positions)
+            ax.set_xticklabels(
+                [CLASS_LABELS.get(cls, cls) for cls in available], rotation=25, ha="right"
+            )
+            ax.set_yscale("log")
+            ax.set_xlabel("instance class")
+        else:
+            total = np.concatenate([data[cls][active][0] for cls in available])
+            prep = np.concatenate([data[cls][active][1] for cls in available])
+            ax.step(
+                *_ecdf(total), where="post", color="#333333", linewidth=1.8,
+                linestyle="-",
+            )
+            ax.step(
+                *_ecdf(prep), where="post", color="#333333", linewidth=1.8,
+                linestyle="--",
+            )
+            ax.set_xscale("log")
+            ax.set_ylim(0, 100)
+            ax.set_xlabel(r"quantum/classical runtime ratio $\rho$")
+        if style == "box":
+            ax.axhline(1.0, color="#555555", linestyle="--", linewidth=1.0)
+            ax.text(0.02, 1.0, "parity", transform=ax.get_yaxis_transform(), va="bottom")
+        else:
+            ax.axvline(1.0, color="#555555", linestyle="--", linewidth=1.0)
+            ax.text(1.0, 0.03, "parity", transform=ax.get_xaxis_transform(), ha="right", rotation=90)
+        ax.set_title(active.upper())
+        ax.grid(True, which="both", color="#E0E0E0", linewidth=0.6)
+
+    axes[0][0].set_ylabel(
+        r"quantum/classical runtime ratio $\rho$" if style == "box"
+        else r"\% of instances with ratio $\leq x$"
+    )
+    series_handles = [
+        mpatches.Patch(facecolor="#777777", label=r"total ($Q\times R$)"),
+        mpatches.Patch(
+            facecolor="#BBBBBB", hatch="///", alpha=0.4,
+            label="one QLSA state preparation (no readout)",
+        ),
+    ] if style == "box" else [
+        mlines.Line2D([], [], color="#333333", linestyle="-", label=r"total ($Q\times R$)"),
+        mlines.Line2D(
+            [], [], color="#333333", linestyle="--",
+            label="one QLSA state preparation (no readout)",
+        ),
+    ]
+    fig.suptitle("Fixed-cycle quantum/classical runtime ratio", y=0.98)
+    fig.legend(
+        handles=series_handles, loc="upper center", bbox_to_anchor=(0.5, 0.92),
+        ncol=2, frameon=False,
+    )
+    fig.text(
+        0.5, 0.01,
+        f"Cycle duration: {_cycle_duration_label(cycle_time)}; classical baseline: "
+        f"{baseline_label}; eligible instances: {eligible}",
+        ha="center", fontsize=9,
+    )
+    fig.tight_layout(rect=(0, 0.05, 1, 0.82))
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+    print(f"Saved to {output}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -406,7 +666,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Plot quantum advantage curves or difficulty (s·κ) histograms.",
+        description="Plot quantum advantage curves, fixed-cycle ratios, or difficulty histograms.",
     )
     parser.add_argument(
         "instance_classes",
@@ -422,13 +682,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--solver",
         choices=list(RUNTIME_KEYS),
-        default="glpk",
-        help="Classical solver runtime to compare against (default: glpk). Ignored with --difficulty.",
+        default="highs-std",
+        help="Classical solver runtime to compare against (default: highs-std). Ignored with --difficulty.",
     )
     parser.add_argument(
         "--difficulty",
         action="store_true",
         help="Plot s·κ difficulty histogram instead of advantage curves.",
+    )
+    parser.add_argument(
+        "--ratio",
+        action="store_true",
+        help="Plot fixed-cycle quantum/classical runtime ratios instead of advantage curves.",
+    )
+    parser.add_argument(
+        "--cycle-time",
+        type=float,
+        default=DEFAULT_CYCLE_DURATION,
+        help="Assumed quantum cycle duration in seconds for --ratio (default: 8e-10).",
+    )
+    parser.add_argument(
+        "--ratio-style",
+        choices=("box", "ecdf"),
+        default="box",
+        help="Ratio plot style (default: box).",
     )
     parser.add_argument(
         "--cache-dir",
@@ -437,6 +714,13 @@ if __name__ == "__main__":
         help="Cache directory (default: cache_dir in current directory).",
     )
     args = parser.parse_args()
+    if args.ratio and args.difficulty:
+        parser.error("--ratio and --difficulty are mutually exclusive")
+    if args.ratio:
+        try:
+            args.cycle_time = _validate_cycle_time(args.cycle_time)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     cache_dir = resolve_cache_root(args.cache_dir)
 
@@ -468,6 +752,19 @@ if __name__ == "__main__":
                 output=Path(f"plot_difficulty_{classes_tag}_{variant}.pdf"),
                 y_max=y_max,
             )
+    elif args.ratio:
+        plot_ratio(
+            instance_classes=classes,
+            cache_dir=cache_dir,
+            output=Path(
+                f"plot_ratio_{classes_tag}_{args.solver}_{args.variant}_{args.ratio_style}.pdf"
+            ),
+            runtime_key=RUNTIME_KEYS[args.solver],
+            baseline_label=args.solver,
+            cycle_time=args.cycle_time,
+            style=args.ratio_style,
+            variant=args.variant,
+        )
     else:
         plot_advantage(
             instance_classes=classes,

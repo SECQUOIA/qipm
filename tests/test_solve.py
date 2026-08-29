@@ -11,6 +11,8 @@ from scipy.sparse import csr_matrix
 
 import standard_form
 from solve import (
+    HIGHS_THREADS,
+    HIGHS_VERSION,
     _merge_solve_result,
     _solve_instance_from_path,
     show_solve_status,
@@ -41,6 +43,24 @@ def test_solve_mps_and_std_write_ok_statuses(stem: str, tmp_path: Path) -> None:
     assert data["solve_status_std"] in ("ok", "ok_ipm")
     assert data["runtime_highs_mps"] >= 0.0
     assert data["runtime_highs_std"] >= 0.0
+    assert data["highs_version"] == HIGHS_VERSION
+    assert data["highs_threads"] == 1
+
+
+@pytest.mark.parametrize("suffix", ["mps", "std"])
+def test_solve_resets_highs_scheduler_after_in_process_transform(
+    suffix: str, tmp_path: Path
+) -> None:
+    stem = "surviving_mixed"
+    instance_dir = tmp_path / "cls" / stem
+    instance_dir.mkdir(parents=True)
+    shutil.copy(FIXTURES / f"{stem}.mps", instance_dir / f"{stem}.mps")
+    transform_instance("cls", stem, cache_dir=tmp_path)
+
+    _solve_instance_from_path(instance_dir / f"{stem}.{suffix}")
+
+    data = json.loads((instance_dir / f"{stem}.data").read_text())
+    assert data[f"solve_status_{suffix}"] in ("ok", "ok_ipm")
 
 
 def test_infeasible_std_records_non_optimal_without_runtime(tmp_path: Path) -> None:
@@ -174,9 +194,14 @@ def test_show_solve_status_accepts_ok_ipm_and_unhashable_status(
 def test_fresh_solve_ledger_writes_runtime_before_status(tmp_path: Path) -> None:
     std_path = tmp_path / "ordered.std"
     _merge_solve_result(std_path, "ok", 1.25)
-    assert std_path.with_suffix(".data").read_text() == (
-        '{"runtime_highs_std": 1.25, "solve_status_std": "ok"}'
-    )
+    data = json.loads(std_path.with_suffix(".data").read_text())
+    assert data == {
+        "runtime_highs_std": 1.25,
+        "solve_status_std": "ok",
+        "highs_version": HIGHS_VERSION,
+        "highs_threads": HIGHS_THREADS,
+    }
+    assert list(data)[:2] == ["runtime_highs_std", "solve_status_std"]
 
 
 def test_solve_instance_file_not_found(tmp_path: Path) -> None:

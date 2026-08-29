@@ -113,9 +113,9 @@ Each instance is solved in two independent modes, controlled by `--format`:
 
 For `.std`, if the default solver fails (e.g. due to poor scaling), the solve is automatically retried with HiGHS's interior-point method.
 
-Each solve runs in a subprocess with a 10-minute timeout. In `both` mode, if the `.mps` solve times out, the `.std` solve is skipped for that instance. Wall-clock solve times are written to the instance's `.data` JSON and serve as the classical baseline for the quantum advantage comparison.
+Each solve runs in a subprocess with a 10-minute timeout. HiGHS is configured with `threads=1` before every solve; when `solve.py` starts the process, it also defaults the OpenMP, OpenBLAS, and MKL thread-count environment variables to 1 unless the user has set them explicitly. In `both` mode, if the `.mps` solve times out, the `.std` solve is skipped for that instance. Wall-clock solve times are written to the instance's `.data` JSON and serve as the classical baseline for the quantum advantage comparison.
 
-`solve_status_mps` and `solve_status_std` record `ok`, `ok_ipm`, `timeout`, `crashed`, `non_optimal`, or `error:<ExceptionName>`. Runtime keys are present only for optimal solves.
+`solve_status_mps` and `solve_status_std` record `ok`, `ok_ipm`, `timeout`, `crashed`, `non_optimal`, or `error:<ExceptionName>`. Runtime keys are present only for optimal solves. The top-level `highs_version` and `highs_threads` keys record solve provenance; the last solve-stage run for either format wins.
 
 ### 4. Benchmark
 
@@ -126,6 +126,7 @@ python benchmark.py                           # all classes, both variants
 python benchmark.py --variant mnes            # MNES only
 python benchmark.py --variant oss netlib      # OSS, netlib class only
 python benchmark.py --cache-dir /my/cache
+python benchmark.py --refresh-counts          # migrate existing benchmark ledgers
 ```
 
 `--variant` accepts `mnes`, `oss`, or `both` (default).
@@ -137,7 +138,17 @@ Two QIPM variants are benchmarked:
 | mnes | Modified Normal Equation System | $\hat{M} = I + \bar{F}\bar{F}^\top$ | $m \times m$ |
 | oss | Orthogonal Subspaces System | $M = [-A^\top \mid V]$ | $n \times n$ |
 
-For each instance, the script reads $A$ from the `.std` file and writes three keys per variant into the instance's `.data` JSON: the cycle count (`cycle_count_mnes` / `cycle_count_oss`), the sparsity parameter $s$ (`sparsity_mnes` / `sparsity_oss`), and the condition number $\kappa$ (`cond_mnes` / `cond_oss`).
+For each instance, the script reads $A$ from the `.std` file and writes these keys for each variant (`v` is `mnes` or `oss`):
+
+| Key | Meaning |
+|---|---|
+| `cycle_count_v` | Headline total cycle count |
+| `sparsity_v` | QLSA sparsity parameter $s$ |
+| `cond_v` | Condition-number bound $\kappa$ |
+| `qlsa_queries_v` | Per-solve QLSA query count $\mathcal{Q}$ |
+| `tomography_reps_v` | Tomography repetition count $R$ |
+
+The stored integer values obey the exact invariant `cycle_count_v = qlsa_queries_v × tomography_reps_v`.
 
 `status_mnes` and `status_oss` record `ok`, `timeout`, `crashed`, `skipped_too_large`, `skipped_degenerate`, `rank_uncertain`, or `error:<ExceptionName>`. Instances with more than 100,000 rows are recorded as `skipped_too_large`.
 
@@ -163,7 +174,7 @@ The $\mathrm{z}_y$ columns equal the columns of $-A^\top$ (nnz of column $j$ = n
 
 When $n_N=0$, MNES uses the exact special case $s=1$; OSS has no $m+1$ null-space-column term and uses the maximum row or column nnz of $A$.
 
-**Cycle count formula** — a single QLSA call costs $\mathcal{Q}=$`cycle_count_qlsa(s, κ, ε)` cycles (Chebyshev query count). The total cycle count is
+**Cycle count formula** — a single QLSA call costs $\mathcal{Q}=$`cycle_count_qlsa(s, κ, ε)` cycles (Chebyshev query count). The implementation uses base-2 logarithms throughout, as in Lemma 1 and Eq. (10) of the paper. The total cycle count is
 
 $$
 \text{cycle count} = \mathcal{Q}\times
@@ -175,9 +186,15 @@ $$
 
 OSS uses the larger factor because of its Hermitian dilation. The required repetition count is rounded up, and $\varepsilon = 0.1$.
 
+`benchmark.py --refresh-counts` updates successful existing ledgers after the log-base correction and backfills the QLSA-query/tomography breakdown without rerunning basis construction or `svds`. It validates the old total exactly, reports anomalous records without changing them, and is safe to run repeatedly. This is a schema/log-base migration that preserves each record's stored parameters, not an algorithm-version upgrade. OSS records are cross-checked against the `.std` dimensions; records that predate the 2026-04-04 OSS convention change are reported for re-benchmarking instead of migrated. Class, cache-directory, and `--variant` selection work as for a normal benchmark run.
+
 ### 5. Plot
 
-`plot.py` produces advantage curves and difficulty histograms from `.data`. It enables Matplotlib's LaTeX renderer, so a working LaTeX installation is required in addition to the Python packages.
+`plot.py` produces advantage curves, fixed-cycle ratio plots, and difficulty histograms from `.data`. The default classical baseline is now `--solver highs-std`; `glpk` and `highs-mps` remain available.
+
+Use `python plot.py --ratio` for fixed-cycle-time quantum/classical ratios. The default box style shows total $Q\times R$ and one QLSA state preparation (no readout) for MNES and OSS; `--ratio-style ecdf` selects empirical CDFs. `--cycle-time` sets the assumed cycle duration in seconds and defaults to $8\times10^{-10}$ s (800 ps), the $\sqrt{\mathrm{SWAP}}$ two-qubit gate reported by He et al., *Nature* **571**, 371 (2019), which Sec. V of the paper uses as an optimistic physical proxy for a logical cycle. Ratio plots require the breakdown keys produced by a current benchmark or `--refresh-counts`, and skip non-positive classical runtimes.
+
+Plotting enables Matplotlib's LaTeX renderer, so a working LaTeX installation is required in addition to the Python packages.
 
 The cache pipeline assumes a single writer per instance; do not run stages concurrently against the same instance directory.
 

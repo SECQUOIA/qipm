@@ -3,6 +3,13 @@
 
 from __future__ import annotations
 
+import os
+
+# Effective when solve.py starts the process before NumPy is imported elsewhere.
+for _thread_env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_thread_env_var, "1")
+del _thread_env_var
+
 import multiprocessing
 import time
 from pathlib import Path
@@ -24,6 +31,8 @@ from store import (
 )
 
 SOLVE_TIMEOUT = 600.0  # 10 minutes per file
+HIGHS_THREADS = 1
+HIGHS_VERSION = highspy.Highs().version()
 
 
 def _merge_solve_result(path: Path, status: str, elapsed: float | None = None) -> None:
@@ -34,6 +43,8 @@ def _merge_solve_result(path: Path, status: str, elapsed: float | None = None) -
     if elapsed is not None:
         values[runtime_key] = elapsed
     values[status_key] = status
+    values["highs_version"] = HIGHS_VERSION
+    values["highs_threads"] = HIGHS_THREADS
     merge_ledger(
         data_path,
         values,
@@ -48,7 +59,9 @@ def _check_highs_call(status: highspy.HighsStatus, operation: str) -> None:
 
 def _solve_mps(path: Path) -> tuple[float | None, str]:
     """Read an MPS model and solve it with HiGHS's default presolve enabled."""
+    highspy.Highs.resetGlobalScheduler(True)
     h = highspy.Highs()
+    _check_highs_call(h.setOptionValue("threads", HIGHS_THREADS), "set threads option")
     h.setOptionValue("log_to_console", False)
     status = h.readModel(str(path))
     _check_highs_call(status, "readModel")
@@ -66,10 +79,12 @@ def _solve_mps(path: Path) -> tuple[float | None, str]:
 
 def _solve_std(path: Path) -> tuple[float | None, str]:
     """Load a validated .std LP, build a HiGHS model, and solve it."""
+    highspy.Highs.resetGlobalScheduler(True)
     c, b, A, _ = load_standard_form(path)
     m, n = A.shape
 
     h = highspy.Highs()
+    _check_highs_call(h.setOptionValue("threads", HIGHS_THREADS), "set threads option")
     h.setOptionValue("log_to_console", False)
     col_lower = np.zeros(n, dtype=np.float64)
     col_upper = np.full(n, _HIGHS_INF, dtype=np.float64)
@@ -99,6 +114,7 @@ def _solve_std(path: Path) -> tuple[float | None, str]:
     if status not in (highspy.HighsStatus.kOk, highspy.HighsStatus.kWarning):
         # Retry with IPM when default solver fails (e.g. badly scaled RHS); IPM often handles scaling better
         _check_highs_call(h.setOptionValue("solver", "ipm"), "set solver option")
+        t0 = time.perf_counter()
         status = h.run()
         elapsed = time.perf_counter() - t0
         _check_highs_call(status, "IPM solve")
@@ -134,7 +150,11 @@ def _solve_with_timeout(path: Path) -> str:
 
     Returns "completed", "timeout", or "crashed" and records parent-detected failures.
     """
-    p = multiprocessing.Process(target=_solve_instance_from_path, args=(path,))
+    # A fresh child cannot inherit a parent-sized HiGHS scheduler and applies
+    # the BLAS thread defaults before NumPy is imported.
+    p = multiprocessing.get_context("spawn").Process(
+        target=_solve_instance_from_path, args=(path,)
+    )
     p.start()
     p.join(SOLVE_TIMEOUT)
     if p.is_alive():

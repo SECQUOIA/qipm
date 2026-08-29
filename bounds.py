@@ -69,6 +69,8 @@ class CycleCountResult:
     count: int
     sparsity: int
     cond: float
+    qlsa_queries: int
+    repetitions: int
 
 
 def cycle_count_qlsa(
@@ -93,8 +95,8 @@ def cycle_count_qlsa(
     sk = float(s) * k
     if not math.isfinite(sk) or sk > math.sqrt(np.finfo(np.float64).max):
         raise OverflowError("s*k is too large for the QLSA cycle-count formula")
-    binst = math.ceil(math.log(sk / epsilon) * sk**2)
-    insqrt = binst * math.log(4 * binst / epsilon)
+    binst = math.ceil(math.log2(sk / epsilon) * sk**2)
+    insqrt = binst * math.log2(4 * binst / epsilon)
     j0_val = int(math.ceil(math.sqrt(insqrt)))
     return 8 * j0_val
 
@@ -341,8 +343,9 @@ def _cycle_count_mnes_from_basis(basis: PreparedBasis) -> CycleCountResult:
         k = max(lam_max / lam_min, 1.0)
 
     repetitions = math.ceil((m - 1) / _EPSILON**2)
-    count = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON) * repetitions
-    return CycleCountResult(count, s, k)
+    qlsa_queries = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON)
+    count = qlsa_queries * repetitions
+    return CycleCountResult(count, s, k, qlsa_queries, repetitions)
 
 
 def _cycle_count_mnes(A: csr_matrix) -> CycleCountResult:
@@ -425,8 +428,9 @@ def _cycle_count_oss_from_basis(basis: PreparedBasis) -> CycleCountResult:
         )
     k = max(sigma_max / sigma_min, 1.0)
     repetitions = math.ceil((2 * n - 1) / _EPSILON**2)
-    count = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON) * repetitions
-    return CycleCountResult(count, s, k)
+    qlsa_queries = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON)
+    count = qlsa_queries * repetitions
+    return CycleCountResult(count, s, k, qlsa_queries, repetitions)
 
 
 def _cycle_count_oss(A: csr_matrix) -> CycleCountResult:

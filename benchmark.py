@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
 
 from bounds import (
@@ -12,11 +13,13 @@ from bounds import (
     PreprocessCrashedError,
     PreprocessTimeoutError,
     RankUncertainError,
+    _EPSILON,
     _cycle_count_mnes,
     _cycle_count_mnes_from_basis,
     _cycle_count_oss,
     _cycle_count_oss_from_basis,
     _preprocess_basis,
+    cycle_count_qlsa,
 )
 from standard_form import load_standard_form
 from store import (
@@ -28,11 +31,24 @@ from store import (
     count_successful_records,
     list_class_names,
     list_instance_dirs,
+    merge_ledger,
     process_instance_dirs,
     purge_keys_from_ledgers,
     read_ledger,
     resolve_cache_root,
 )
+
+
+def _legacy_cycle_count_qlsa(*, s: int, k: float, epsilon: float = _EPSILON) -> int:
+    """Return the former ln-based count used only to migrate stored results."""
+    if s <= 0 or k < 1 or epsilon <= 0 or not math.isfinite(k):
+        raise ValueError("invalid legacy cycle-count inputs")
+    sk = float(s) * k
+    if not math.isfinite(sk) or sk > math.sqrt(sys.float_info.max):
+        raise OverflowError("s*k is too large for the legacy cycle-count formula")
+    binst = math.ceil(math.log(sk / epsilon) * sk**2)
+    insqrt = binst * math.log(4 * binst / epsilon)
+    return 8 * int(math.ceil(math.sqrt(insqrt)))
 
 
 def _benchmark_instance_from_path(
@@ -97,10 +113,12 @@ def _benchmark_instance_from_path(
         cond = max(float(result.cond), 1.0)
         if not math.isfinite(cond):
             raise ArithmeticError("condition number is not finite")
-        count_key, sparsity_key, cond_key = BENCHMARK_VALUE_KEYS[active]
-        data[count_key] = result.count
-        data[sparsity_key] = result.sparsity
-        data[cond_key] = cond
+        keys = BENCHMARK_VALUE_KEYS[active]
+        data[keys.count] = result.count
+        data[keys.sparsity] = result.sparsity
+        data[keys.cond] = cond
+        data[keys.qlsa_queries] = result.qlsa_queries
+        data[keys.tomography_reps] = result.repetitions
         data[BENCHMARK_STATUS_KEYS[active]] = "ok"
 
     if variant == "both":
@@ -239,7 +257,7 @@ def show_benchmark_status(
         counts = {
             active: count_successful_records(
                 subdirs,
-                value_key=BENCHMARK_VALUE_KEYS[active][0],
+                value_key=BENCHMARK_VALUE_KEYS[active].count,
                 status_key=BENCHMARK_STATUS_KEYS[active],
                 ok_statuses=("ok",),
             )
@@ -265,6 +283,192 @@ def clear_benchmark_data(
 
     search_roots = [root / name for name in instance_classes] if instance_classes else [root]
     purge_keys_from_ledgers(search_roots, keys)
+
+
+def _stored_integer(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, float) or not math.isfinite(value) or not value.is_integer():
+        return None
+    return int(value)
+
+
+def _stored_finite_number(value: object) -> bool:
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def refresh_benchmark_counts(
+    instance_classes: list[str] | None = None,
+    cache_dir: str | Path | None = None,
+    variant: str = "both",
+) -> None:
+    """Correct legacy ln-based totals and add their query/repetition breakdown."""
+    root = resolve_cache_root(cache_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Cache directory not found: {root}")
+    if instance_classes is None:
+        instance_classes = list_class_names(root)
+    active_variants = VARIANTS if variant == "both" else (variant,)
+    refreshed = 0
+    already_current = 0
+    anomaly_count = 0
+
+    def _report_anomaly(name: str, detail: str) -> None:
+        nonlocal anomaly_count
+        anomaly_count += 1
+        print(f"anomaly: {name}: {detail}")
+
+    for cls in instance_classes:
+        folder = root / cls
+        if not folder.is_dir():
+            print(f"{cls}: directory not found")
+            continue
+        for instance_dir in list_instance_dirs(folder):
+            oss_dimensions_checked = False
+            oss_expected: tuple[int, int] | None = None
+            for data_path in sorted(instance_dir.glob("*.data")):
+                ledger_name = f"{cls}/{instance_dir.name} [ledger]"
+                try:
+                    data, state = read_ledger(data_path)
+                except OSError as exc:
+                    _report_anomaly(ledger_name, f"could not read {data_path.name}: {exc}")
+                    continue
+                if state != "valid":
+                    _report_anomaly(ledger_name, f"invalid ledger {data_path.name}")
+                    continue
+                updates: dict[str, int] = {}
+                pending_refreshes = 0
+                for active in active_variants:
+                    keys = BENCHMARK_VALUE_KEYS[active]
+                    status_key = BENCHMARK_STATUS_KEYS[active]
+                    raw_total = data.get(keys.count)
+                    legacy_done = (
+                        status_key not in data and _stored_finite_number(raw_total)
+                    )
+                    if data.get(status_key) != "ok" and not legacy_done:
+                        continue
+                    name = f"{cls}/{instance_dir.name} [{active}]"
+                    s = _stored_integer(data.get(keys.sparsity))
+                    k = data.get(keys.cond)
+                    total = _stored_integer(raw_total)
+                    if s is None or s <= 0:
+                        _report_anomaly(name, "sparsity must be a positive integer")
+                        continue
+                    if isinstance(k, bool) or not _stored_finite_number(k) or k < 1:
+                        _report_anomaly(name, "condition number must be finite and at least 1")
+                        continue
+                    if total is None or total < 0:
+                        _report_anomaly(name, "cycle count must be a non-negative integer")
+                        continue
+                    try:
+                        q_new = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON)
+                    except (ValueError, OverflowError, ArithmeticError) as exc:
+                        _report_anomaly(
+                            name, f"could not recompute corrected QLSA count: {exc}"
+                        )
+                        continue
+
+                    q_present = keys.qlsa_queries in data
+                    reps_present = keys.tomography_reps in data
+                    if q_present or reps_present:
+                        stored_q = _stored_integer(data.get(keys.qlsa_queries))
+                        stored_reps = _stored_integer(data.get(keys.tomography_reps))
+                        if (
+                            q_present
+                            and reps_present
+                            and stored_q == q_new
+                            and stored_reps is not None
+                            and stored_reps >= 0
+                            and total == stored_q * stored_reps
+                        ):
+                            already_current += 1
+                            continue
+                        _report_anomaly(name, "new-format breakdown is inconsistent")
+                        continue
+
+                    try:
+                        q_old = _legacy_cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON)
+                    except (ValueError, OverflowError, ArithmeticError) as exc:
+                        _report_anomaly(
+                            name, f"could not recompute legacy QLSA count: {exc}"
+                        )
+                        continue
+                    repetitions, remainder = divmod(total, q_old)
+                    float_x_value: int | None = None
+                    if remainder != 0:
+                        try:
+                            x_value = round(total * _EPSILON**2 / q_old)
+                            historical_total = int(
+                                q_old * x_value / _EPSILON**2
+                            )
+                        except (OverflowError, ValueError):
+                            historical_total = None
+                            x_value = -1
+                        if x_value >= 0 and historical_total == total:
+                            float_x_value = x_value
+                            repetitions = math.ceil(x_value / _EPSILON**2)
+                        else:
+                            _report_anomaly(
+                                name,
+                                f"legacy total {total} matches neither exact-product "
+                                f"nor float-truncated assembly for Q_old={q_old}",
+                            )
+                            continue
+                    if active == "oss":
+                        if not oss_dimensions_checked:
+                            oss_dimensions_checked = True
+                            std_files = sorted(instance_dir.glob("*.std"))
+                            # Missing or unreadable .std is off-contract for a
+                            # benchmark record; retain the migration fallback.
+                            if len(std_files) == 1:
+                                try:
+                                    _, _, std_A, _ = load_standard_form(std_files[0])
+                                except Exception:  # noqa: BLE001 - off-contract fallback
+                                    pass
+                                else:
+                                    x_expected = 2 * std_A.shape[1] - 1
+                                    oss_expected = (
+                                        x_expected,
+                                        math.ceil(x_expected / _EPSILON**2),
+                                    )
+                        if oss_expected is not None:
+                            x_expected, reps_expected = oss_expected
+                            convention_matches = (
+                                repetitions == reps_expected
+                                if float_x_value is None
+                                else float_x_value == x_expected
+                            )
+                            if not convention_matches:
+                                _report_anomaly(
+                                    name,
+                                    "OSS repetition basis does not match the .std "
+                                    "dimensions — the record likely predates the "
+                                    "2026-04-04 OSS convention change (33bbc70); "
+                                    "re-benchmark this instance",
+                                )
+                                continue
+                    updates[keys.qlsa_queries] = q_new
+                    updates[keys.tomography_reps] = repetitions
+                    updates[keys.count] = q_new * repetitions
+                    pending_refreshes += 1
+                if updates:
+                    try:
+                        merge_ledger(data_path, updates)
+                    except (OSError, ValueError) as exc:
+                        _report_anomaly(
+                            ledger_name, f"could not write {data_path.name}: {exc}"
+                        )
+                    else:
+                        refreshed += pending_refreshes
+
+    print(
+        f"Refreshed {refreshed} variant records; already current: {already_current}; "
+        f"anomalies: {anomaly_count}."
+    )
 
 
 if __name__ == "__main__":
@@ -300,6 +504,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Show how many instances per class have benchmark data for the selected variant(s). Other flags are ignored.",
     )
+    parser.add_argument(
+        "--refresh-counts",
+        action="store_true",
+        help="Correct legacy cycle totals and backfill the query/repetition breakdown without benchmarking.",
+    )
     args = parser.parse_args()
     if args.show:
         show_benchmark_status(
@@ -309,6 +518,12 @@ if __name__ == "__main__":
         )
     elif args.clear:
         clear_benchmark_data(
+            instance_classes=args.instance_classes or None,
+            cache_dir=args.cache_dir,
+            variant=args.variant,
+        )
+    elif args.refresh_counts:
+        refresh_benchmark_counts(
             instance_classes=args.instance_classes or None,
             cache_dir=args.cache_dir,
             variant=args.variant,

@@ -16,6 +16,7 @@ import bounds
 from benchmark import (
     _benchmark_instance_from_path,
     clear_benchmark_data,
+    refresh_benchmark_counts,
     show_benchmark_status,
 )
 from bounds import (
@@ -68,7 +69,7 @@ def test_handcrafted_standard_form_layout_remains_compatible(tmp_path: Path) -> 
     assert obj_offset == 0.0
 
 
-@pytest.mark.parametrize(("s", "k", "expected"), [(1, 1.0, 32), (2, 1.0, 72)])
+@pytest.mark.parametrize(("s", "k", "expected"), [(1, 1.0, 48), (2, 1.0, 112)])
 def test_cycle_count_exact(s: int, k: float, expected: int) -> None:
     assert cycle_count_qlsa(s=s, k=k) == expected
 
@@ -159,12 +160,16 @@ def test_repetition_counts_use_ceiling_at_both_sites(monkeypatch) -> None:
         None,
         csr_matrix((2, 0)),
     )
-    mnes_count = _cycle_count_mnes_from_basis(basis).count
+    mnes = _cycle_count_mnes_from_basis(basis)
     monkeypatch.setattr(bounds, "_sigma_timed", lambda *args: 1.0)
-    oss_count = _cycle_count_oss_from_basis(basis).count
+    oss = _cycle_count_oss_from_basis(basis)
     qlsa_count = cycle_count_qlsa(s=1, k=1.0)
-    assert mnes_count == qlsa_count * 100
-    assert oss_count == qlsa_count * 300
+    assert (mnes.qlsa_queries, mnes.repetitions, mnes.count) == (
+        qlsa_count, 100, qlsa_count * 100
+    )
+    assert (oss.qlsa_queries, oss.repetitions, oss.count) == (
+        qlsa_count, 300, qlsa_count * 300
+    )
 
 
 def test_degenerate_instance_is_skipped_without_counts(tmp_path: Path) -> None:
@@ -273,12 +278,19 @@ def test_corrupt_std_retracts_stale_benchmark_values(tmp_path: Path) -> None:
     std_path = tmp_path / "corrupt.std"
     std_path.write_bytes(b"truncated")
     (tmp_path / "corrupt.data").write_text(
-        json.dumps({"cycle_count_mnes": 10, "status_mnes": "ok"})
+        json.dumps({
+            "cycle_count_mnes": 10,
+            "qlsa_queries_mnes": 5,
+            "tomography_reps_mnes": 2,
+            "status_mnes": "ok",
+        })
     )
     _benchmark_instance_from_path(std_path, variant="mnes")
     data = json.loads((tmp_path / "corrupt.data").read_text())
     assert data["status_mnes"].startswith("error:")
     assert "cycle_count_mnes" not in data
+    assert "qlsa_queries_mnes" not in data
+    assert "tomography_reps_mnes" not in data
 
 
 def test_fractional_indices_are_rejected_by_benchmark_loader(tmp_path: Path) -> None:
@@ -308,6 +320,12 @@ def test_benchmark_both_records_success(tmp_path: Path) -> None:
         assert data[f"status_{variant}"] == "ok"
         assert data[f"cycle_count_{variant}"] > 0
         assert data[f"cond_{variant}"] >= 1.0
+        assert type(data[f"qlsa_queries_{variant}"]) is int
+        assert type(data[f"tomography_reps_{variant}"]) is int
+        assert type(data[f"cycle_count_{variant}"]) is int
+        assert data[f"cycle_count_{variant}"] == (
+            data[f"qlsa_queries_{variant}"] * data[f"tomography_reps_{variant}"]
+        )
 
 
 def test_both_mode_preserves_mnes_when_oss_fails(tmp_path: Path, monkeypatch) -> None:
@@ -321,7 +339,7 @@ def test_both_mode_preserves_mnes_when_oss_fails(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(
         benchmark,
         "_cycle_count_mnes_from_basis",
-        lambda basis: CycleCountResult(100, 2, 0.9),
+        lambda basis: CycleCountResult(100, 2, 0.9, 25, 4),
     )
 
     def _fail(basis):
@@ -333,13 +351,22 @@ def test_both_mode_preserves_mnes_when_oss_fails(tmp_path: Path, monkeypatch) ->
     assert data["status_mnes"] == "ok"
     assert data["cycle_count_mnes"] == 100
     assert data["cond_mnes"] == 1.0
+    assert data["qlsa_queries_mnes"] == 25
+    assert data["tomography_reps_mnes"] == 4
     assert data["status_oss"] == "error:OverflowError"
     assert data["cycle_count_oss"] is None
+    assert data["qlsa_queries_oss"] is None
+    assert data["tomography_reps_oss"] is None
 
 
 def test_show_and_clear_use_status_with_legacy_fallback(tmp_path: Path, capsys) -> None:
     for name, data in {
-        "ok": {"status_mnes": "ok", "cycle_count_mnes": 10},
+        "ok": {
+            "status_mnes": "ok",
+            "cycle_count_mnes": 10,
+            "qlsa_queries_mnes": 5,
+            "tomography_reps_mnes": 2,
+        },
         "failed": {"status_mnes": "timeout", "cycle_count_mnes": 10},
         "legacy": {"cycle_count_mnes": 5},
         "bad_legacy": {"cycle_count_mnes": float("inf")},
@@ -354,3 +381,343 @@ def test_show_and_clear_use_status_with_legacy_fallback(tmp_path: Path, capsys) 
         data = json.loads(data_path.read_text())
         assert "status_mnes" not in data
         assert "cycle_count_mnes" not in data
+        assert "qlsa_queries_mnes" not in data
+        assert "tomography_reps_mnes" not in data
+
+
+def test_refresh_counts_migrates_exact_product_record_and_is_idempotent(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "legacy"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "legacy.data"
+    data_path.write_text(json.dumps({
+        "status_mnes": "ok",
+        "sparsity_mnes": 2,
+        "cond_mnes": 1.0,
+        "cycle_count_mnes": 7200,
+    }))
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+    migrated = json.loads(data_path.read_text())
+    assert migrated["qlsa_queries_mnes"] == 112
+    assert migrated["tomography_reps_mnes"] == 100
+    assert migrated["cycle_count_mnes"] == 11200
+    assert (
+        "Refreshed 1 variant records; already current: 0; anomalies: 0."
+        in capsys.readouterr().out
+    )
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+    assert json.loads(data_path.read_text()) == migrated
+    assert (
+        "Refreshed 0 variant records; already current: 1; anomalies: 0."
+        in capsys.readouterr().out
+    )
+
+
+def test_refresh_counts_recovers_float_truncated_legacy_total(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "float_era"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "float_era.data"
+    s, k, x_value = 3, 12.5, 36
+    q_old = benchmark._legacy_cycle_count_qlsa(s=s, k=k)
+    legacy_total = int(q_old * x_value / bounds._EPSILON**2)
+    assert legacy_total % q_old != 0
+    data_path.write_text(json.dumps({
+        "sparsity_mnes": s,
+        "cond_mnes": k,
+        "cycle_count_mnes": legacy_total,
+    }))
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+
+    repetitions = math.ceil(x_value / bounds._EPSILON**2)
+    q_new = cycle_count_qlsa(s=s, k=k, epsilon=bounds._EPSILON)
+    migrated = json.loads(data_path.read_text())
+    assert migrated["qlsa_queries_mnes"] == q_new
+    assert migrated["tomography_reps_mnes"] == repetitions
+    assert migrated["cycle_count_mnes"] == q_new * repetitions
+    assert "Refreshed 1 variant records" in capsys.readouterr().out
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+    assert json.loads(data_path.read_text()) == migrated
+    assert "already current: 1" in capsys.readouterr().out
+
+
+def test_refresh_counts_rejects_old_convention_oss_record_with_std(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "old_oss"
+    instance_dir.mkdir(parents=True)
+    _write_std(
+        instance_dir / "old_oss.std",
+        np.array([[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]]),
+    )
+    data_path = instance_dir / "old_oss.data"
+    s, k, old_x = 3, 12.5, 3
+    q_old = benchmark._legacy_cycle_count_qlsa(s=s, k=k)
+    legacy_total = int(q_old * old_x / bounds._EPSILON**2)
+    data_path.write_text(json.dumps({
+        "sparsity_oss": s,
+        "cond_oss": k,
+        "cycle_count_oss": legacy_total,
+    }))
+    original = data_path.read_bytes()
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="oss")
+
+    assert data_path.read_bytes() == original
+    output = capsys.readouterr().out
+    assert "OSS repetition basis does not match the .std dimensions" in output
+    assert "re-benchmark this instance" in output
+    assert "anomalies: 1" in output
+
+
+def test_refresh_counts_migrates_current_convention_oss_record_with_std(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "current_oss"
+    instance_dir.mkdir(parents=True)
+    _write_std(
+        instance_dir / "current_oss.std",
+        np.array([[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]]),
+    )
+    data_path = instance_dir / "current_oss.data"
+    s, k, current_x = 3, 12.5, 7
+    q_old = benchmark._legacy_cycle_count_qlsa(s=s, k=k)
+    legacy_total = int(q_old * current_x / bounds._EPSILON**2)
+    data_path.write_text(json.dumps({
+        "sparsity_oss": s,
+        "cond_oss": k,
+        "cycle_count_oss": legacy_total,
+    }))
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="oss")
+
+    repetitions = math.ceil(current_x / bounds._EPSILON**2)
+    q_new = cycle_count_qlsa(s=s, k=k, epsilon=bounds._EPSILON)
+    migrated = json.loads(data_path.read_text())
+    assert migrated["qlsa_queries_oss"] == q_new
+    assert migrated["tomography_reps_oss"] == repetitions
+    assert migrated["cycle_count_oss"] == q_new * repetitions
+    assert "Refreshed 1 variant records" in capsys.readouterr().out
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="oss")
+    assert json.loads(data_path.read_text()) == migrated
+    assert "already current: 1" in capsys.readouterr().out
+
+
+def test_refresh_counts_migrates_oss_record_without_std_fallback(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "oss_no_std"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "oss_no_std.data"
+    s, k, x_value = 3, 12.5, 3
+    q_old = benchmark._legacy_cycle_count_qlsa(s=s, k=k)
+    legacy_total = int(q_old * x_value / bounds._EPSILON**2)
+    data_path.write_text(json.dumps({
+        "sparsity_oss": s,
+        "cond_oss": k,
+        "cycle_count_oss": legacy_total,
+    }))
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="oss")
+
+    repetitions = math.ceil(x_value / bounds._EPSILON**2)
+    q_new = cycle_count_qlsa(s=s, k=k, epsilon=bounds._EPSILON)
+    migrated = json.loads(data_path.read_text())
+    assert migrated["qlsa_queries_oss"] == q_new
+    assert migrated["tomography_reps_oss"] == repetitions
+    assert migrated["cycle_count_oss"] == q_new * repetitions
+    assert "Refreshed 1 variant records" in capsys.readouterr().out
+
+
+def test_refresh_counts_migrates_statusless_zero_total_and_is_idempotent(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "zero"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "zero.data"
+    data_path.write_text(json.dumps({
+        "sparsity_mnes": 1,
+        "cond_mnes": 1.0,
+        "cycle_count_mnes": 0,
+    }))
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+
+    migrated = json.loads(data_path.read_text())
+    assert migrated["qlsa_queries_mnes"] == 48
+    assert migrated["tomography_reps_mnes"] == 0
+    assert migrated["cycle_count_mnes"] == 0
+    assert "Refreshed 1 variant records" in capsys.readouterr().out
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+    assert json.loads(data_path.read_text()) == migrated
+    assert "already current: 1" in capsys.readouterr().out
+
+
+def test_refresh_counts_leaves_mismatched_legacy_record_untouched(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "mismatch"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "mismatch.data"
+    original = {
+        "status_mnes": "ok",
+        "sparsity_mnes": 1,
+        "cond_mnes": 1.0,
+        "cycle_count_mnes": 321,
+    }
+    data_path.write_text(json.dumps(original))
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+    assert json.loads(data_path.read_text()) == original
+    output = capsys.readouterr().out
+    assert "anomaly: cls/mismatch [mnes]" in output
+    assert "anomalies: 1" in output
+
+
+def test_refresh_counts_rejects_partial_breakdown_without_rewriting(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "partial"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "partial.data"
+    data_path.write_text(json.dumps({
+        "status_mnes": "ok",
+        "sparsity_mnes": 1,
+        "cond_mnes": 1.0,
+        "cycle_count_mnes": 480,
+        "qlsa_queries_mnes": 48,
+    }))
+    original = data_path.read_bytes()
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+
+    assert data_path.read_bytes() == original
+    output = capsys.readouterr().out
+    assert "anomaly: cls/partial [mnes]: new-format breakdown is inconsistent" in output
+    assert "anomalies: 1" in output
+
+
+def test_refresh_counts_migrates_statusless_legacy_record(
+    tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "statusless"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "statusless.data"
+    data_path.write_text(json.dumps({
+        "sparsity_mnes": 1,
+        "cond_mnes": 1.0,
+        "cycle_count_mnes": 320,
+    }))
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+
+    data = json.loads(data_path.read_text())
+    assert data["qlsa_queries_mnes"] == 48
+    assert data["tomography_reps_mnes"] == 10
+    assert data["cycle_count_mnes"] == 480
+    assert "Refreshed 1 variant records" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("sparsity_mnes", False),
+        ("sparsity_mnes", 1.5),
+        ("sparsity_mnes", -1),
+        ("cond_mnes", float("inf")),
+        ("cond_mnes", 0.5),
+        ("cycle_count_mnes", -1),
+        ("sparsity_mnes", 10**1000),
+    ],
+)
+def test_refresh_counts_reports_malformed_success_values(
+    key: str, value: object, tmp_path: Path, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "malformed"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "malformed.data"
+    record = {
+        "status_mnes": "ok",
+        "sparsity_mnes": 1,
+        "cond_mnes": 1.0,
+        "cycle_count_mnes": 320,
+    }
+    record[key] = value
+    data_path.write_text(json.dumps(record))
+    original = data_path.read_bytes()
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+
+    assert data_path.read_bytes() == original
+    output = capsys.readouterr().out
+    assert "anomaly: cls/malformed [mnes]" in output
+    assert "anomalies: 1" in output
+
+
+def test_refresh_counts_reports_invalid_ledger(tmp_path: Path, capsys) -> None:
+    instance_dir = tmp_path / "cls" / "invalid"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "invalid.data"
+    data_path.write_text("not json")
+
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+
+    assert data_path.read_text() == "not json"
+    output = capsys.readouterr().out
+    assert "anomaly: cls/invalid [ledger]: invalid ledger invalid.data" in output
+    assert "anomalies: 1" in output
+
+
+def test_refresh_counts_reports_ledger_read_error(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "unreadable"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "unreadable.data"
+    data_path.write_text("{}")
+
+    def fail_read(path):
+        raise OSError("read failed")
+
+    monkeypatch.setattr(benchmark, "read_ledger", fail_read)
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+
+    output = capsys.readouterr().out
+    assert "anomaly: cls/unreadable [ledger]: could not read unreadable.data" in output
+    assert "anomalies: 1" in output
+
+
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+def test_refresh_counts_reports_write_error_without_counting_refresh(
+    error_type: type[Exception], tmp_path: Path, monkeypatch, capsys
+) -> None:
+    instance_dir = tmp_path / "cls" / "unwritable"
+    instance_dir.mkdir(parents=True)
+    data_path = instance_dir / "unwritable.data"
+    original = {
+        "status_mnes": "ok",
+        "sparsity_mnes": 1,
+        "cond_mnes": 1.0,
+        "cycle_count_mnes": 320,
+    }
+    data_path.write_text(json.dumps(original))
+
+    def fail_write(path, values):
+        raise error_type("write failed")
+
+    monkeypatch.setattr(benchmark, "merge_ledger", fail_write)
+    refresh_benchmark_counts(["cls"], cache_dir=tmp_path, variant="mnes")
+
+    assert json.loads(data_path.read_text()) == original
+    output = capsys.readouterr().out
+    assert "anomaly: cls/unwritable [ledger]: could not write unwritable.data" in output
+    assert "Refreshed 0 variant records" in output
+    assert "anomalies: 1" in output
