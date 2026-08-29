@@ -8,12 +8,15 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
-highspy = pytest.importorskip("highspy", reason="highspy required for transform tests")
+import highspy
 import transform
-from transform import (
+from standard_form import (
     _HIGHS_INF,
     _lp_to_standard_form,
     _strip_zero_rows,
+    load_standard_form,
+)
+from transform import (
     clear_std_files,
     transform_instance,
 )
@@ -40,12 +43,7 @@ SURVIVING_DATA = {
 
 
 def _load_std(path: Path) -> tuple[np.ndarray, np.ndarray, csr_matrix, float]:
-    data = np.load(path, allow_pickle=False)
-    shape = tuple(data["A_shape"])
-    A = csr_matrix(
-        (data["A_data"], data["A_indices"], data["A_indptr"]), shape=shape
-    )
-    return data["c"], data["b"], A, float(data["obj_offset"])
+    return load_standard_form(path)
 
 
 def _highs_objective(path: Path) -> float:
@@ -311,6 +309,37 @@ def test_clear_std_files_purges_downstream_data(tmp_path: Path) -> None:
     assert json.loads(data_path.read_text()) == SURVIVING_DATA
     assert not (corrupt_dir / "corrupt.std").exists()
     assert json.loads(corrupt_data.read_text()) == {}
+
+
+def test_clear_std_files_interleaves_purge_and_unlink_by_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("b", "a"):
+        instance_dir = tmp_path / "cls" / name
+        instance_dir.mkdir(parents=True)
+        (instance_dir / f"{name}.data").write_text(
+            json.dumps({"transform_status": "ok"})
+        )
+        (instance_dir / f"{name}.std").write_bytes(b"std")
+
+    real_unlink = Path.unlink
+    unlinked_instances = []
+
+    def checked_unlink(path: Path, *args, **kwargs) -> None:
+        if path.suffix == ".std":
+            data = json.loads(path.with_suffix(".data").read_text())
+            assert "transform_status" not in data
+            if path.parent.name == "a":
+                pending_data = json.loads(
+                    (tmp_path / "cls" / "b" / "b.data").read_text()
+                )
+                assert "transform_status" in pending_data
+            unlinked_instances.append(path.parent.name)
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", checked_unlink)
+    clear_std_files(["cls"], cache_dir=tmp_path)
+    assert unlinked_instances == ["a", "b"]
 
 
 @pytest.mark.parametrize(

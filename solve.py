@@ -3,59 +3,42 @@
 
 from __future__ import annotations
 
-import json
-import math
 import multiprocessing
-import os
-import tempfile
 import time
 from pathlib import Path
 
 import highspy
 import numpy as np
-from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
+from standard_form import _HIGHS_INF, load_standard_form
+
+from store import (
+    SOLVE_RESULT_KEYS,
+    count_successful_records,
+    list_class_names,
+    list_instance_dirs,
+    merge_ledger,
+    process_instance_dirs,
+    resolve_cache_root,
+)
+
 SOLVE_TIMEOUT = 600.0  # 10 minutes per file
-
-try:
-    _HIGHS_INF = highspy.kHighsInf
-except AttributeError:
-    _HIGHS_INF = 1e30
-
-
-def _atomic_write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as tmp:
-            tmp_name = tmp.name
-            json.dump(data, tmp, indent=None)
-        os.chmod(tmp_name, 0o644)
-        os.replace(tmp_name, path)
-    finally:
-        if tmp_name is not None and os.path.exists(tmp_name):
-            os.unlink(tmp_name)
 
 
 def _merge_solve_result(path: Path, status: str, elapsed: float | None = None) -> None:
     suffix = path.suffix.lower()[1:]
     data_path = path.with_suffix(".data")
-    try:
-        data = json.loads(data_path.read_text()) if data_path.exists() else {}
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    runtime_key = f"runtime_highs_{suffix}"
-    if elapsed is None:
-        data.pop(runtime_key, None)
-    else:
-        data[runtime_key] = elapsed
-    data[f"solve_status_{suffix}"] = status
-    _atomic_write_json(data_path, data)
+    runtime_key, status_key = SOLVE_RESULT_KEYS[suffix]
+    values = {}
+    if elapsed is not None:
+        values[runtime_key] = elapsed
+    values[status_key] = status
+    merge_ledger(
+        data_path,
+        values,
+        remove_keys=(runtime_key,) if elapsed is None else (),
+    )
 
 
 def _check_highs_call(status: highspy.HighsStatus, operation: str) -> None:
@@ -83,51 +66,8 @@ def _solve_mps(path: Path) -> tuple[float | None, str]:
 
 def _solve_std(path: Path) -> tuple[float | None, str]:
     """Load a validated .std LP, build a HiGHS model, and solve it."""
-    data = np.load(path)
-    c = np.asarray(data["c"], dtype=np.float64).ravel()
-    b = np.asarray(data["b"], dtype=np.float64).ravel()
-    A_data = np.asarray(data["A_data"], dtype=np.float64).ravel()
-    raw_indices = np.asarray(data["A_indices"]).ravel()
-    raw_indptr = np.asarray(data["A_indptr"]).ravel()
-    raw_shape = np.asarray(data["A_shape"]).ravel()
-
-    def _integer_metadata(values: np.ndarray, name: str) -> np.ndarray:
-        try:
-            integer_valued = np.issubdtype(values.dtype, np.integer) or (
-                np.all(np.isfinite(values)) and np.all(values == np.floor(values))
-            )
-        except TypeError:
-            integer_valued = False
-        if not integer_valued:
-            raise ValueError(f".std {name} must be integer-valued")
-        return np.asarray(values, dtype=np.int64)
-
-    A_indices = _integer_metadata(raw_indices, "A_indices")
-    A_indptr = _integer_metadata(raw_indptr, "A_indptr")
-    A_shape = _integer_metadata(raw_shape, "A_shape")
-    if A_shape.size != 2 or np.any(A_shape < 0):
-        raise ValueError("A_shape must contain two non-negative dimensions")
-    n, m = int(A_shape[1]), int(A_shape[0])  # A is (m, n)
-    if len(c) != n or len(b) != m or len(A_indptr) != m + 1:
-        raise ValueError(".std vector or CSR pointer dimensions do not match A_shape")
-    if not all(np.all(np.isfinite(values)) for values in (c, b, A_data)):
-        raise ValueError(".std contains non-finite numeric values")
-    if len(A_indices) != len(A_data):
-        raise ValueError(".std CSR indices and values have different lengths")
-    if A_indptr.size and (
-        A_indptr[0] != 0
-        or A_indptr[-1] != len(A_data)
-        or np.any(np.diff(A_indptr) < 0)
-    ):
-        raise ValueError(".std has invalid CSR row pointers")
-    if np.any(A_indices < 0) or np.any(A_indices >= n):
-        raise ValueError(".std CSR column index is out of range")
-    int32_max = np.iinfo(np.int32).max
-    if m > int32_max or n > int32_max or len(A_data) > int32_max:
-        raise OverflowError(".std dimensions exceed HiGHS int32 sparse-index limits")
-    if np.any(A_indptr > int32_max) or np.any(A_indices > int32_max):
-        raise OverflowError(".std sparse indices exceed int32 range")
-    A = csr_matrix((A_data, A_indices, A_indptr), shape=(m, n))
+    c, b, A, _ = load_standard_form(path)
+    m, n = A.shape
 
     h = highspy.Highs()
     h.setOptionValue("log_to_console", False)
@@ -231,7 +171,7 @@ def solve_instance(
     if format not in ("mps", "std", "both"):
         raise ValueError(f"format must be 'mps', 'std', or 'both'; got {format!r}")
 
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     instance_dir = root / instance_class / instance_name
     if not instance_dir.is_dir():
         raise FileNotFoundError(f"Instance directory not found: {instance_dir}")
@@ -267,17 +207,19 @@ def solve_instance_class(
     if format not in ("mps", "std", "both"):
         raise ValueError(f"format must be 'mps', 'std', or 'both'; got {format!r}")
 
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     folder = root / instance_class
     if not folder.is_dir():
         raise FileNotFoundError(f"Instance class folder not found: {folder}")
 
-    subdirs = sorted(d for d in folder.iterdir() if d.is_dir())
-    for subdir in tqdm(subdirs, desc=instance_class, unit="instance"):
-        try:
-            solve_instance(instance_class, subdir.name, cache_dir=root, format=format)
-        except Exception as exc:  # noqa: BLE001 - isolate corpus instances
-            tqdm.write(f"skipping {subdir.name}: {exc}")
+    subdirs = list_instance_dirs(folder)
+    process_instance_dirs(
+        instance_class,
+        subdirs,
+        lambda subdir: solve_instance(
+            instance_class, subdir.name, cache_dir=root, format=format
+        ),
+    )
 
 
 def solve_all_instance_classes(
@@ -292,12 +234,12 @@ def solve_all_instance_classes(
     cache_dir: directory containing instance-class subfolders; defaults to "cache_dir" in the current directory.
     format: "mps" | "std" | "both" — which instance format to solve (default "both").
     """
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Cache directory not found: {root}")
 
     if instance_classes is None:
-        instance_classes = [f.name for f in sorted(root.iterdir()) if f.is_dir()]
+        instance_classes = list_class_names(root)
 
     for name in instance_classes:
         solve_instance_class(name, root, format=format)
@@ -313,17 +255,13 @@ def show_solve_status(
     For each instance class, prints one line showing counts for the active format(s):
     "<class>  [mps: x/total]  [std: x/total]".
     """
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Cache directory not found: {root}")
 
     if instance_classes is None:
-        instance_classes = [f.name for f in sorted(root.iterdir()) if f.is_dir()]
+        instance_classes = list_class_names(root)
 
-    active_keys = {
-        "mps": "runtime_highs_mps",
-        "std": "runtime_highs_std",
-    }
     active_formats = ["mps", "std"] if format == "both" else [format]
 
     for cls in instance_classes:
@@ -332,28 +270,17 @@ def show_solve_status(
             print(f"{cls}: directory not found")
             continue
 
-        subdirs = sorted(d for d in folder.iterdir() if d.is_dir())
+        subdirs = list_instance_dirs(folder)
         total = len(subdirs)
-
-        counts: dict[str, int] = {fmt: 0 for fmt in active_formats}
-        for subdir in subdirs:
-            data_files = list(subdir.glob("*.data"))
-            try:
-                data = json.loads(data_files[0].read_text()) if data_files else {}
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                data = {}
-            if not isinstance(data, dict):
-                data = {}
-            for fmt in active_formats:
-                status_key = f"solve_status_{fmt}"
-                value = data.get(active_keys[fmt])
-                legacy_done = (
-                    status_key not in data
-                    and isinstance(value, (int, float))
-                    and math.isfinite(value)
-                )
-                if data.get(status_key) in ("ok", "ok_ipm") or legacy_done:
-                    counts[fmt] += 1
+        counts = {
+            fmt: count_successful_records(
+                subdirs,
+                value_key=SOLVE_RESULT_KEYS[fmt][0],
+                status_key=SOLVE_RESULT_KEYS[fmt][1],
+                ok_statuses=("ok", "ok_ipm"),
+            )
+            for fmt in active_formats
+        }
 
         parts = "  ".join(f"{fmt}: {counts[fmt]}/{total}" for fmt in active_formats)
         print(f"{cls}:  {parts}")

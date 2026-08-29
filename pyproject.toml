@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qipm"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "highspy>=1.7.0",
+    "matplotlib>=3.5.0",
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "sparseqr>=1.5.0",
+    "tqdm>=4.60.0",
+]
+
+[tool.setuptools]
+py-modules = [
+    "store",
+    "standard_form",
+    "bounds",
+    "extract",
+    "transform",
+    "solve",
+    "benchmark",
+    "plot",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

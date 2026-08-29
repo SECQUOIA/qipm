@@ -3,322 +3,45 @@
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 import warnings
 from pathlib import Path
 
 import highspy
-from tqdm import tqdm
-import numpy as np
-from scipy.sparse import csr_matrix
-
-# HiGHS uses ±inf for unbounded bounds
-try:
-    _HIGHS_INF = highspy.kHighsInf
-except AttributeError:
-    _HIGHS_INF = 1e30  # fallback if constant not exposed
-
-
-def _lp_to_standard_form(
-    num_col: int,
-    num_row: int,
-    col_cost: np.ndarray,
-    col_lower: np.ndarray,
-    col_upper: np.ndarray,
-    row_lower: np.ndarray,
-    row_upper: np.ndarray,
-    a_start: np.ndarray,
-    a_index: np.ndarray,
-    a_value: np.ndarray,
-    obj_offset: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray, csr_matrix, float]:
-    """Convert HiGHS LP (col_lower <= x <= col_upper, row_lower <= Ax <= row_upper) to standard form.
-
-    Standard form: min c'x  s.t.  Ax = b,  x >= 0.
-
-    Returns (c, b, A, obj_offset) with A in CSR sparse format.
-    """
-    inf = _HIGHS_INF
-    # Convert to numpy arrays once (avoid repeated conversion in caller)
-    col_cost = np.asarray(col_cost, dtype=np.float64).ravel()
-    col_lower = np.asarray(col_lower, dtype=np.float64).ravel()
-    col_upper = np.asarray(col_upper, dtype=np.float64).ravel()
-    row_lower = np.asarray(row_lower, dtype=np.float64).ravel()
-    row_upper = np.asarray(row_upper, dtype=np.float64).ravel()
-    a_start = np.asarray(a_start, dtype=np.int64).ravel()
-    a_index = np.asarray(a_index, dtype=np.int64).ravel()
-    a_value = np.asarray(a_value, dtype=np.float64).ravel()
-
-    # Precompute dense row index mapping: fully-free rows (lo=-inf, hi=inf) contribute
-    # no constraint in standard form and are dropped entirely.
-    free_row = (row_lower <= -inf) & (row_upper >= inf)
-    row_map = np.where(free_row, -1, np.cumsum(~free_row) - 1).astype(np.int64)
-    m_base = int((~free_row).sum())  # number of non-free original rows
-
-    new_col_count = 0
-    c_list: list[float] = []
-    b_list: list[float] = []
-    extra_b_list: list[float] = []
-    row_list: list[int] = []
-    col_list: list[int] = []
-    val_list: list[float] = []
-    extra_row_list: list[int] = []
-    extra_col_list: list[int] = []
-    extra_val_list: list[float] = []
-    row_constant = np.zeros(num_row, dtype=np.float64)
-    objective_constant = float(obj_offset)
-
-    def add_var(cost: float) -> int:
-        nonlocal new_col_count
-        j = new_col_count
-        new_col_count += 1
-        c_list.append(cost)
-        return j
-
-    # Single pass over columns: map to non-negative variables and accumulate row_constant
-    for j in range(num_col):
-        lj = col_lower[j]
-        uj = col_upper[j]
-        cj = col_cost[j]
-        beg = a_start[j]
-        end = a_start[j + 1]
-        row_ind = a_index[beg:end]
-        row_vals = a_value[beg:end]
-
-        if lj > -inf and uj < inf:
-            objective_constant += cj * lj
-            j1 = add_var(cj)
-            j2 = add_var(0.0)
-            width = uj - lj
-            r = m_base + len(extra_b_list)
-            extra_b_list.append(width)
-            extra_row_list.append(r)
-            extra_col_list.append(j1)
-            extra_val_list.append(1.0)
-            extra_row_list.append(r)
-            extra_col_list.append(j2)
-            extra_val_list.append(1.0)
-            for idx in range(len(row_ind)):
-                i = row_ind[idx]
-                v = row_vals[idx]
-                ri = row_map[i]
-                if ri >= 0:
-                    row_list.append(ri)
-                    col_list.append(j1)
-                    val_list.append(v)
-                row_constant[i] += v * lj
-            continue
-
-        if lj > -inf and uj >= inf:
-            objective_constant += cj * lj
-            j1 = add_var(cj)
-            for idx in range(len(row_ind)):
-                i = row_ind[idx]
-                v = row_vals[idx]
-                ri = row_map[i]
-                if ri >= 0:
-                    row_list.append(ri)
-                    col_list.append(j1)
-                    val_list.append(v)
-                row_constant[i] += v * lj
-            continue
-        if lj <= -inf and uj < inf:
-            objective_constant += cj * uj
-            j1 = add_var(-cj)
-            for idx in range(len(row_ind)):
-                i = row_ind[idx]
-                v = row_vals[idx]
-                ri = row_map[i]
-                if ri >= 0:
-                    row_list.append(ri)
-                    col_list.append(j1)
-                    val_list.append(-v)
-                row_constant[i] += v * uj
-            continue
-        # Free variable
-        j_plus = add_var(cj)
-        j_minus = add_var(-cj)
-        for idx in range(len(row_ind)):
-            i = row_ind[idx]
-            v = row_vals[idx]
-            ri = row_map[i]
-            if ri >= 0:
-                row_list.append(ri)
-                col_list.append(j_plus)
-                val_list.append(v)
-                row_list.append(ri)
-                col_list.append(j_minus)
-                val_list.append(-v)
-
-    # Add slacks and set b for original rows
-    for i in range(num_row):
-        lo = row_lower[i]
-        hi = row_upper[i]
-        ri = row_map[i]
-        if lo == hi:
-            b_list.append(lo - row_constant[i])
-        elif lo <= -inf and hi < inf:
-            j_slack = add_var(0.0)
-            row_list.append(ri)
-            col_list.append(j_slack)
-            val_list.append(1.0)
-            b_list.append(hi - row_constant[i])
-        elif lo > -inf and hi >= inf:
-            j_slack = add_var(0.0)
-            row_list.append(ri)
-            col_list.append(j_slack)
-            val_list.append(-1.0)
-            b_list.append(lo - row_constant[i])
-        elif lo <= -inf and hi >= inf:
-            # Fully free row: no constraint, skip entirely.
-            pass
-        else:
-            j_slack = add_var(0.0)
-            row_list.append(ri)
-            col_list.append(j_slack)
-            val_list.append(1.0)
-            b_list.append(hi - row_constant[i])
-            extra_b_list.append(hi - lo)
-            r = m_base + len(extra_b_list) - 1
-            extra_row_list.append(r)
-            extra_col_list.append(j_slack)
-            extra_val_list.append(1.0)
-            j_s2 = add_var(0.0)
-            extra_row_list.append(r)
-            extra_col_list.append(j_s2)
-            extra_val_list.append(1.0)
-
-    n_std = new_col_count
-    m_std = len(b_list) + len(extra_b_list)
-    b_std = np.empty(m_std, dtype=np.float64)
-    b_std[:len(b_list)] = b_list
-    b_std[len(b_list):] = extra_b_list
-    c_std = np.fromiter(c_list, dtype=np.float64, count=len(c_list))
-
-    nnz = len(row_list) + len(extra_row_list)
-    if nnz == 0:
-        A_std = csr_matrix((m_std, n_std))
-    else:
-        row_arr = np.empty(nnz, dtype=np.int64)
-        col_arr = np.empty(nnz, dtype=np.int64)
-        val_arr = np.empty(nnz, dtype=np.float64)
-        n1 = len(row_list)
-        row_arr[:n1] = row_list
-        col_arr[:n1] = col_list
-        val_arr[:n1] = val_list
-        row_arr[n1:] = extra_row_list
-        col_arr[n1:] = extra_col_list
-        val_arr[n1:] = extra_val_list
-        A_std = csr_matrix((val_arr, (row_arr, col_arr)), shape=(m_std, n_std))
-    return c_std, b_std, A_std, objective_constant
-
-
-def _atomic_write_json(path: Path, data: dict) -> None:
-    """Atomically replace a JSON file with data."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as tmp:
-            tmp_name = tmp.name
-            json.dump(data, tmp, indent=None)
-        os.chmod(tmp_name, 0o644)
-        os.replace(tmp_name, path)
-    finally:
-        if tmp_name is not None and os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-
-
-_DOWNSTREAM_DATA_KEYS = (
-    "cycle_count_mnes",
-    "cycle_count_oss",
-    "sparsity_mnes",
-    "sparsity_oss",
-    "cond_mnes",
-    "cond_oss",
-    "status_mnes",
-    "status_oss",
-    "runtime_highs_std",
-    "solve_status_std",
+from standard_form import (
+    _atomic_write_std,
+    _lp_to_standard_form,
+    _std_matches,
+    _strip_zero_rows,
+    standard_form_arrays,
+)
+from store import (
+    STD_DERIVED_KEYS,
+    TRANSFORM_STATUS_KEY,
+    list_class_names,
+    list_instance_dirs,
+    merge_ledger,
+    process_instance_dirs,
+    purge_keys_from_ledger,
+    resolve_cache_root,
 )
 
 
-def _read_data_object(data_path: Path) -> dict:
-    """Read a JSON object, treating corrupt or non-object data as empty."""
-    try:
-        data = json.loads(data_path.read_text()) if data_path.exists() else {}
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def _merge_transform_status(path: Path, status: str, *, retract: bool = False) -> None:
-    data_path = path.with_suffix(".data")
-    data = _read_data_object(data_path)
-    if retract:
-        for key in _DOWNSTREAM_DATA_KEYS:
-            data.pop(key, None)
-    data["transform_status"] = status
-    _atomic_write_json(data_path, data)
+    merge_ledger(
+        path.with_suffix(".data"),
+        {TRANSFORM_STATUS_KEY: status},
+        remove_keys=STD_DERIVED_KEYS if retract else (),
+    )
 
 
 def _purge_downstream_data(path: Path) -> None:
-    """Atomically retract results derived from an earlier standard form."""
-    data_path = path.with_suffix(".data")
-    data = _read_data_object(data_path)
-    for key in _DOWNSTREAM_DATA_KEYS:
-        data.pop(key, None)
-    _atomic_write_json(data_path, data)
+    """Retract results derived from an earlier standard form."""
+    merge_ledger(path.with_suffix(".data"), remove_keys=STD_DERIVED_KEYS)
 
 
 def _withhold_standard_form(path: Path, status: str) -> None:
     _merge_transform_status(path, status, retract=True)
     path.with_suffix(".std").unlink(missing_ok=True)
-
-
-def _atomic_write_std(path: Path, **arrays: np.ndarray | float) -> None:
-    """Atomically write a compressed NPZ using the requested .std filename."""
-    tmp_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w+b", dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as tmp:
-            tmp_name = tmp.name
-            np.savez_compressed(tmp, **arrays)
-        os.chmod(tmp_name, 0o644)
-        os.replace(tmp_name, path)
-    finally:
-        if tmp_name is not None and os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-
-
-def _std_matches(path: Path, arrays: dict[str, np.ndarray | float]) -> bool:
-    """Return whether an existing .std contains exactly the produced arrays."""
-    if not path.is_file():
-        return False
-    try:
-        with np.load(path, allow_pickle=False) as existing:
-            return all(
-                key in existing.files and np.array_equal(existing[key], np.asarray(value))
-                for key, value in arrays.items()
-            )
-    except Exception:  # noqa: BLE001 - unreadable existing output must be replaced
-        return False
-
-
-def _strip_zero_rows(A: csr_matrix, b: np.ndarray) -> tuple[csr_matrix, np.ndarray] | None:
-    """Drop harmless zero rows, returning None when a zero row has nonzero RHS."""
-    row_nnz = np.diff(A.indptr)
-    zero_rows = row_nnz == 0
-    if np.any(zero_rows & (np.abs(b) > 1e-9)):
-        return None
-    keep = ~zero_rows
-    if not keep.all():
-        return A[keep], b[keep]
-    return A, b
 
 
 def _transform_instance_impl(path: Path) -> bool | None:
@@ -400,15 +123,7 @@ def _transform_instance_impl(path: Path) -> bool | None:
         return
     A, b = stripped
 
-    arrays = {
-        "c": c,
-        "b": b,
-        "A_data": A.data,
-        "A_indices": A.indices,
-        "A_indptr": A.indptr,
-        "A_shape": np.array(A.shape),
-        "obj_offset": np.array(obj_offset, dtype=np.float64),
-    }
+    arrays = standard_form_arrays(c, b, A, obj_offset)
     out_std = path.with_suffix(".std")
     changed = not _std_matches(out_std, arrays)
     if changed:
@@ -443,7 +158,7 @@ def transform_instance(
     instance_name: subfolder name (instance stem).
     cache_dir: root containing instance-class subfolders; defaults to "cache_dir".
     """
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     instance_dir = root / instance_class / instance_name
     if not instance_dir.is_dir():
         raise FileNotFoundError(f"Instance directory not found: {instance_dir}")
@@ -464,20 +179,18 @@ def transform_instance_class(
     instance_class: name of the subfolder (e.g. "netlib", "miplib", "clique").
     cache_dir: directory containing instance-class subfolders; defaults to "cache_dir" in the current directory.
     """
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     folder = root / instance_class
     if not folder.is_dir():
         raise FileNotFoundError(f"Instance class folder not found: {folder}")
 
-    subdirs = sorted(d for d in folder.iterdir() if d.is_dir())
-    for subdir in tqdm(subdirs, desc=instance_class, unit="instance"):
-        if not any(subdir.glob("*.mps")):
-            tqdm.write(f"skipping {subdir.name}: no .mps file")
-            continue
-        try:
-            transform_instance(instance_class, subdir.name, cache_dir=root)
-        except Exception as exc:  # noqa: BLE001 - isolate corpus instances
-            tqdm.write(f"skipping {subdir.name}: {exc}")
+    process_instance_dirs(
+        instance_class,
+        list_instance_dirs(folder),
+        lambda subdir: transform_instance(instance_class, subdir.name, cache_dir=root),
+        required_glob="*.mps",
+        missing_message="no .mps file",
+    )
 
 
 def transform_all_instance_classes(
@@ -490,12 +203,12 @@ def transform_all_instance_classes(
         If None, all instance classes (all subdirectories of cache_dir) are processed.
     cache_dir: directory containing instance-class subfolders; defaults to "cache_dir" in the current directory.
     """
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Cache directory not found: {root}")
 
     if instance_classes is None:
-        instance_classes = [f.name for f in sorted(root.iterdir()) if f.is_dir()]
+        instance_classes = list_class_names(root)
 
     for name in instance_classes:
         transform_instance_class(name, root)
@@ -509,12 +222,12 @@ def show_transform_status(
 
     For each instance class, prints "<class>: x/total".
     """
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Cache directory not found: {root}")
 
     if instance_classes is None:
-        instance_classes = [f.name for f in sorted(root.iterdir()) if f.is_dir()]
+        instance_classes = list_class_names(root)
 
     for cls in instance_classes:
         folder = root / cls
@@ -522,7 +235,7 @@ def show_transform_status(
             print(f"{cls}: directory not found")
             continue
 
-        subdirs = sorted(d for d in folder.iterdir() if d.is_dir())
+        subdirs = list_instance_dirs(folder)
         total = len(subdirs)
         done = sum(1 for d in subdirs if any(d.glob("*.std")))
         print(f"{cls}: {done}/{total}")
@@ -533,11 +246,12 @@ def clear_std_files(
     cache_dir: str | Path | None = None,
 ) -> None:
     """Delete .std files and purge their transform, solve, and benchmark data."""
-    root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
+    root = resolve_cache_root(cache_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Cache directory not found: {root}")
 
     search_roots = [root / name for name in instance_classes] if instance_classes else [root]
+    keys = (TRANSFORM_STATUS_KEY,) + STD_DERIVED_KEYS
     for search_root in search_roots:
         instance_dirs = {
             path.parent
@@ -546,20 +260,7 @@ def clear_std_files(
         }
         for instance_dir in sorted(instance_dirs, key=str):
             for data_path in instance_dir.glob("*.data"):
-                invalid_data = False
-                try:
-                    data = json.loads(data_path.read_text())
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    data = {}
-                    invalid_data = True
-                if not isinstance(data, dict):
-                    data = {}
-                    invalid_data = True
-                keys = ("transform_status",) + _DOWNSTREAM_DATA_KEYS
-                if invalid_data or any(key in data for key in keys):
-                    for key in keys:
-                        data.pop(key, None)
-                    _atomic_write_json(data_path, data)
+                purge_keys_from_ledger(data_path, keys, sanitize_invalid=True)
             for std_path in instance_dir.glob("*.std"):
                 std_path.unlink()
 

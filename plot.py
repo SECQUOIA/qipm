@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 
@@ -11,6 +10,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
+
+from store import (
+    BENCHMARK_VALUE_KEYS,
+    SOLVE_RESULT_KEYS,
+    VARIANTS,
+    list_class_names,
+    list_instance_dirs,
+    read_ledger,
+    resolve_cache_root,
+)
 
 GATE_SPEED_RECORD = 8e-10  # seconds — update as needed
 N_POINTS = 500
@@ -39,12 +48,9 @@ CLASS_COLORS = {
 
 RUNTIME_KEYS = {
     "glpk":      "runtime_glpk",
-    "highs-std": "runtime_highs_std",
-    "highs-mps": "runtime_highs_mps",
+    "highs-std": SOLVE_RESULT_KEYS["std"][0],
+    "highs-mps": SOLVE_RESULT_KEYS["mps"][0],
 }
-
-# Maps variant names to benchmark data key suffixes
-_VARIANT_SUFFIX = {"mnes": "mnes", "oss": "oss"}
 
 _RCPARAMS = {
     "font.family": "serif",
@@ -84,17 +90,15 @@ def _iter_records(instance_classes: list[str], cache_dir: Path) -> dict[str, lis
         if not cls_dir.is_dir():
             continue
         records = []
-        for instance_dir in sorted(cls_dir.iterdir()):
-            if not instance_dir.is_dir():
-                continue
+        for instance_dir in list_instance_dirs(cls_dir):
             data_path = instance_dir / (instance_dir.name + ".data")
             if not data_path.exists():
                 continue
             try:
-                record = json.loads(data_path.read_text())
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                record, state = read_ledger(data_path)
+            except OSError:
                 continue
-            if isinstance(record, dict):
+            if state == "valid":
                 records.append(record)
         if records:
             result[cls] = records
@@ -118,8 +122,8 @@ def _load_advantage_data(
             r for r in records
             if _finite_number(r.get(runtime_key))
             and (
-                _finite_number(r.get("cycle_count_mnes"), positive=True)
-                or _finite_number(r.get("cycle_count_oss"), positive=True)
+                _finite_number(r.get(BENCHMARK_VALUE_KEYS["mnes"][0]), positive=True)
+                or _finite_number(r.get(BENCHMARK_VALUE_KEYS["oss"][0]), positive=True)
             )
         ]
         if filtered:
@@ -129,13 +133,37 @@ def _load_advantage_data(
 
 def _cycle_counts(records: list[dict], variant: str) -> np.ndarray | None:
     """Extract cycle counts for a single variant ('mnes' or 'oss')."""
-    key = "cycle_count_" + _VARIANT_SUFFIX[variant]
+    key = BENCHMARK_VALUE_KEYS[variant][0]
     vals = [r[key] for r in records if _finite_number(r.get(key), positive=True)]
     return np.array(vals, dtype=np.float64) if vals else None
 
 
 def _crossover_times(cycle_counts: np.ndarray, runtimes: np.ndarray) -> np.ndarray:
     return runtimes / cycle_counts
+
+
+def _advantage_pairs(
+    data: dict[str, list[dict]], variants: list[str], runtime_key: str
+) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]:
+    """Build aligned cycle-count/runtime arrays once for every class and variant."""
+    result: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+    for cls, records in data.items():
+        class_pairs = {}
+        for variant in variants:
+            key = BENCHMARK_VALUE_KEYS[variant][0]
+            pairs = [
+                (record[key], record[runtime_key])
+                for record in records
+                if _finite_number(record.get(key), positive=True)
+            ]
+            if pairs:
+                class_pairs[variant] = (
+                    np.array([count for count, _ in pairs], dtype=np.float64),
+                    np.array([runtime for _, runtime in pairs], dtype=np.float64),
+                )
+        if class_pairs:
+            result[cls] = class_pairs
+    return result
 
 
 def _advantage_curve(ct: np.ndarray, t_values: np.ndarray) -> np.ndarray:
@@ -165,33 +193,26 @@ def plot_advantage(
         print("No data found.")
         return
 
-    variants = list(_VARIANT_SUFFIX) if variant == "both" else [variant]
+    variants = list(VARIANTS) if variant == "both" else [variant]
     if variant == "both":
         complete = {}
         for cls, records in data.items():
             selected = [
                 record
                 for record in records
-                if _finite_number(record.get("cycle_count_mnes"), positive=True)
-                and _finite_number(record.get("cycle_count_oss"), positive=True)
+                if _finite_number(record.get(BENCHMARK_VALUE_KEYS["mnes"][0]), positive=True)
+                and _finite_number(record.get(BENCHMARK_VALUE_KEYS["oss"][0]), positive=True)
             ]
             if selected:
                 complete[cls] = selected
         data = complete
 
-    all_cts: list[np.ndarray] = []
-    for cls, records in data.items():
-        for v in variants:
-            gc = _cycle_counts(records, v)
-            if gc is None:
-                continue
-            key = "cycle_count_" + _VARIANT_SUFFIX[v]
-            hrs = np.array(
-                [r[runtime_key] for r in records if _finite_number(r.get(key), positive=True)],
-                dtype=np.float64,
-            )
-            if len(gc) == len(hrs) and len(gc) > 0:
-                all_cts.append(_crossover_times(gc, hrs))
+    pair_data = _advantage_pairs(data, variants, runtime_key)
+    all_cts = [
+        _crossover_times(counts, runtimes)
+        for class_pairs in pair_data.values()
+        for counts, runtimes in class_pairs.values()
+    ]
 
     if not all_cts:
         print("No valid data for the requested variant.")
@@ -226,19 +247,12 @@ def plot_advantage(
 
     linestyles = {"mnes": "-", "oss": "--"}
 
-    for cls, records in data.items():
+    for cls, class_pairs in pair_data.items():
         color = class_colors[cls]
         for v in variants:
-            key = "cycle_count_" + _VARIANT_SUFFIX[v]
-            pairs = [
-                (r, r[runtime_key])
-                for r in records
-                if _finite_number(r.get(key), positive=True)
-            ]
-            if not pairs:
+            if v not in class_pairs:
                 continue
-            gc = np.array([r[key] for r, _ in pairs], dtype=np.float64)
-            hr = np.array([h for _, h in pairs], dtype=np.float64)
+            gc, hr = class_pairs[v]
             ct = _crossover_times(gc, hr)
             curve = _advantage_curve(ct, t_values)
             tv, cv = _truncate_at_zero(t_values, curve)
@@ -303,9 +317,7 @@ def _load_difficulty_data(
     variant: str,
 ) -> dict[str, np.ndarray]:
     """Load s·κ products for each class for the given variant ('mnes' or 'oss')."""
-    suffix = _VARIANT_SUFFIX[variant]
-    sparsity_key = f"sparsity_{suffix}"
-    cond_key = f"cond_{suffix}"
+    _, sparsity_key, cond_key = BENCHMARK_VALUE_KEYS[variant]
     all_records = _iter_records(instance_classes, cache_dir)
     result: dict[str, np.ndarray] = {}
     for cls, records in all_records.items():
@@ -323,6 +335,21 @@ def _load_difficulty_data(
     return result
 
 
+def _build_difficulty_histogram(
+    data: dict[str, np.ndarray],
+) -> tuple[np.ndarray, list[str], list[np.ndarray], np.ndarray]:
+    """Build shared bins, class order, values, and stacked counts."""
+    all_values = np.concatenate(list(data.values()))
+    bins = _difficulty_bins(all_values)
+    classes_sorted = sorted(data.keys(), key=lambda cls: float(np.median(data[cls])))
+    values = [data[cls] for cls in classes_sorted]
+    stacked = np.zeros(N_BINS, dtype=np.float64)
+    for class_values in values:
+        counts, _ = np.histogram(class_values, bins=bins)
+        stacked += counts
+    return bins, classes_sorted, values, stacked
+
+
 def plot_difficulty(
     instance_classes: list[str],
     variant: str,
@@ -336,18 +363,15 @@ def plot_difficulty(
         print(f"No difficulty data found for {variant}; skipping.")
         return
 
-    all_values = np.concatenate(list(data.values()))
-    pos = all_values[np.isfinite(all_values) & (all_values > 0)]
-    bins = _difficulty_bins(pos)
+    bins, classes_sorted, histogram_values, _ = _build_difficulty_histogram(data)
     lower, upper = float(bins[0]), float(bins[-1])
 
     plt.rcParams.update(_RCPARAMS)
 
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    classes_sorted = sorted(data.keys(), key=lambda c: float(np.median(data[c])))
     ax.hist(
-        [data[cls] for cls in classes_sorted],
+        histogram_values,
         bins=bins,
         stacked=True,
         color=[CLASS_COLORS.get(cls, "#888888") for cls in classes_sorted],
@@ -414,29 +438,24 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    cache_dir = args.cache_dir if args.cache_dir is not None else Path("cache_dir").resolve()
+    cache_dir = resolve_cache_root(args.cache_dir)
 
     if args.instance_classes:
         classes = args.instance_classes
         classes_tag = "-".join(classes)
     else:
-        classes = [d.name for d in sorted(cache_dir.iterdir()) if d.is_dir()] if cache_dir.is_dir() else []
+        classes = list_class_names(cache_dir) if cache_dir.is_dir() else []
         classes_tag = "all"
 
     if args.difficulty:
-        variants = list(_VARIANT_SUFFIX) if args.variant == "both" else [args.variant]
+        variants = list(VARIANTS) if args.variant == "both" else [args.variant]
         if len(variants) > 1:
             peak_counts = []
             for v in variants:
                 vdata = _load_difficulty_data(classes, cache_dir, v)
                 if not vdata:
                     continue
-                all_vals = np.concatenate(list(vdata.values()))
-                bins = _difficulty_bins(all_vals)
-                stacked = np.zeros(N_BINS, dtype=np.float64)
-                for cls in sorted(vdata.keys(), key=lambda c: float(np.median(vdata[c]))):
-                    c, _ = np.histogram(vdata[cls], bins=bins)
-                    stacked += c
+                _, _, _, stacked = _build_difficulty_histogram(vdata)
                 peak_counts.append(int(stacked.max()))
             y_max: float | None = max(peak_counts) * 1.1 if peak_counts else None
         else:

@@ -10,35 +10,62 @@ import pytest
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import lsmr, lsqr
 
-sparseqr = pytest.importorskip("sparseqr", reason="sparseqr required for benchmark tests")
+import sparseqr
 import benchmark
+import bounds
 from benchmark import (
-    RankUncertainError,
     _benchmark_instance_from_path,
+    clear_benchmark_data,
+    show_benchmark_status,
+)
+from bounds import (
+    CycleCountResult,
+    PreparedBasis,
+    RankUncertainError,
     _cycle_count_mnes_from_basis,
     _cycle_count_oss_from_basis,
     _preprocess_basis,
     _preprocess_basis_worker,
     _sigma_min_random_probes,
-    clear_benchmark_data,
     cycle_count_qlsa,
-    show_benchmark_status,
 )
+from standard_form import load_standard_form, write_standard_form
 
 
 def _write_std(path: Path, A: np.ndarray) -> None:
     sparse = csr_matrix(A, dtype=np.float64)
+    write_standard_form(
+        path,
+        np.ones(sparse.shape[1]),
+        np.ones(sparse.shape[0]),
+        sparse,
+    )
+
+
+def _write_raw_std(path: Path, **overrides: np.ndarray) -> None:
+    """Handcraft the disk layout independently of the production writer."""
+    arrays = {
+        "c": np.ones(2),
+        "b": np.ones(2),
+        "A_data": np.ones(2),
+        "A_indices": np.array([0, 1]),
+        "A_indptr": np.array([0, 1, 2]),
+        "A_shape": np.array([2, 2]),
+        "obj_offset": np.array(0.0),
+    }
+    arrays.update(overrides)
     with path.open("wb") as stream:
-        np.savez_compressed(
-            stream,
-            c=np.ones(sparse.shape[1]),
-            b=np.ones(sparse.shape[0]),
-            A_data=sparse.data,
-            A_indices=sparse.indices,
-            A_indptr=sparse.indptr,
-            A_shape=np.array(sparse.shape),
-            obj_offset=np.array(0.0),
-        )
+        np.savez_compressed(stream, **arrays)
+
+
+def test_handcrafted_standard_form_layout_remains_compatible(tmp_path: Path) -> None:
+    std_path = tmp_path / "layout.std"
+    _write_raw_std(std_path)
+    c, b, A, obj_offset = load_standard_form(std_path)
+    np.testing.assert_array_equal(c, np.ones(2))
+    np.testing.assert_array_equal(b, np.ones(2))
+    np.testing.assert_array_equal(A.toarray(), np.eye(2))
+    assert obj_offset == 0.0
 
 
 @pytest.mark.parametrize(("s", "k", "expected"), [(1, 1.0, 32), (2, 1.0, 72)])
@@ -65,13 +92,15 @@ def test_cycle_count_monotone_and_guards_overflow() -> None:
 )
 def test_reported_condition_numbers_are_lower_bounds(A_dense: np.ndarray) -> None:
     basis = _preprocess_basis(csr_matrix(A_dense))
-    A, m, n, B, N, n_N, A_B_lu, A_N = basis
-    _, _, k_mnes = _cycle_count_mnes_from_basis(*basis)
+    A, m, n = basis.A, basis.m, basis.n
+    B, N, n_N = basis.B, basis.N, basis.n_N
+    A_B_lu, A_N = basis.A_B_lu, basis.A_N
+    k_mnes = _cycle_count_mnes_from_basis(basis).cond
     F = A_B_lu.solve(A_N.toarray()) if n_N else np.empty((m, 0))
     true_mnes = np.linalg.cond(np.eye(m) + F @ F.T)
     assert 1.0 <= k_mnes <= true_mnes * (1 + 1e-8)
 
-    _, _, k_oss = _cycle_count_oss_from_basis(*basis)
+    k_oss = _cycle_count_oss_from_basis(basis).cond
     V = np.empty((n, n_N))
     if n_N:
         V[B, :] = -F
@@ -98,27 +127,29 @@ def test_mnes_production_fallback_probes_wide_fbar_on_left(monkeypatch) -> None:
         )
     )
     basis = _preprocess_basis(A)
-    assert basis[5] > basis[1]
-    monkeypatch.setattr(benchmark, "_sigma_timed", lambda *args: None)
-    _, _, reported_k = _cycle_count_mnes_from_basis(*basis)
-    F = basis[6].solve(basis[7].toarray())
-    true_k = np.linalg.cond(np.eye(basis[1]) + F @ F.T)
+    assert basis.n_N > basis.m
+    monkeypatch.setattr(bounds, "_sigma_timed", lambda *args: None)
+    reported_k = _cycle_count_mnes_from_basis(basis).cond
+    F = basis.A_B_lu.solve(basis.A_N.toarray())
+    true_k = np.linalg.cond(np.eye(basis.m) + F @ F.T)
     assert reported_k <= true_k * (1 + 1e-8)
 
 
 def test_empty_nonbasic_partition_uses_exact_shortcuts() -> None:
     A = csr_matrix(np.array([[1.0, 1.0], [0.0, 1.0]]))
     basis = _preprocess_basis(A)
-    assert basis[5] == 0
-    _, s_mnes, k_mnes = _cycle_count_mnes_from_basis(*basis)
-    _, s_oss, _ = _cycle_count_oss_from_basis(*basis)
+    assert basis.n_N == 0
+    mnes = _cycle_count_mnes_from_basis(basis)
+    oss = _cycle_count_oss_from_basis(basis)
+    s_mnes, k_mnes = mnes.sparsity, mnes.cond
+    s_oss = oss.sparsity
     assert (s_mnes, k_mnes) == (1, 1.0)
     assert s_oss == 2
 
 
 def test_repetition_counts_use_ceiling_at_both_sites(monkeypatch) -> None:
     A = csr_matrix(np.eye(2))
-    basis = (
+    basis = PreparedBasis(
         A,
         2,
         2,
@@ -128,9 +159,9 @@ def test_repetition_counts_use_ceiling_at_both_sites(monkeypatch) -> None:
         None,
         csr_matrix((2, 0)),
     )
-    mnes_count, _, _ = _cycle_count_mnes_from_basis(*basis)
-    monkeypatch.setattr(benchmark, "_sigma_timed", lambda *args: 1.0)
-    oss_count, _, _ = _cycle_count_oss_from_basis(*basis)
+    mnes_count = _cycle_count_mnes_from_basis(basis).count
+    monkeypatch.setattr(bounds, "_sigma_timed", lambda *args: 1.0)
+    oss_count = _cycle_count_oss_from_basis(basis).count
     qlsa_count = cycle_count_qlsa(s=1, k=1.0)
     assert mnes_count == qlsa_count * 100
     assert oss_count == qlsa_count * 300
@@ -252,18 +283,18 @@ def test_corrupt_std_retracts_stale_benchmark_values(tmp_path: Path) -> None:
 
 def test_fractional_indices_are_rejected_by_benchmark_loader(tmp_path: Path) -> None:
     std_path = tmp_path / "fractional.std"
-    with std_path.open("wb") as stream:
-        np.savez_compressed(
-            stream,
-            c=np.ones(2),
-            b=np.ones(2),
-            A_data=np.ones(2),
-            A_indices=np.array([0.9, 1.0]),
-            A_indptr=np.array([0, 1, 2]),
-            A_shape=np.array([2, 2]),
-        )
+    _write_raw_std(std_path, A_indices=np.array([0.9, 1.0]))
     _benchmark_instance_from_path(std_path, variant="mnes")
     data = json.loads((tmp_path / "fractional.data").read_text())
+    assert data["status_mnes"] == "error:ValueError"
+    assert "cycle_count_mnes" not in data
+
+
+def test_out_of_range_indices_are_rejected_by_benchmark_loader(tmp_path: Path) -> None:
+    std_path = tmp_path / "out_of_range.std"
+    _write_raw_std(std_path, A_indices=np.array([0, 2]))
+    _benchmark_instance_from_path(std_path, variant="mnes")
+    data = json.loads(std_path.with_suffix(".data").read_text())
     assert data["status_mnes"] == "error:ValueError"
     assert "cycle_count_mnes" not in data
 
@@ -283,13 +314,17 @@ def test_both_mode_preserves_mnes_when_oss_fails(tmp_path: Path, monkeypatch) ->
     std_path = tmp_path / "partial.std"
     _write_std(std_path, np.eye(2))
     monkeypatch.setattr(
-        benchmark, "_preprocess_basis", lambda A: (A, 2, None, None, None, None, None, None)
+        benchmark,
+        "_preprocess_basis",
+        lambda A: PreparedBasis(A, 2, 2, None, None, 0, None, None),
     )
     monkeypatch.setattr(
-        benchmark, "_cycle_count_mnes_from_basis", lambda *basis: (100, 2, 0.9)
+        benchmark,
+        "_cycle_count_mnes_from_basis",
+        lambda basis: CycleCountResult(100, 2, 0.9),
     )
 
-    def _fail(*basis):
+    def _fail(basis):
         raise OverflowError("too large")
 
     monkeypatch.setattr(benchmark, "_cycle_count_oss_from_basis", _fail)

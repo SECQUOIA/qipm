@@ -2,14 +2,21 @@
 
 import json
 import shutil
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
-pytest.importorskip("highspy", reason="highspy required for solve tests")
-from solve import _solve_instance_from_path, solve_instance
+import standard_form
+from solve import (
+    _merge_solve_result,
+    _solve_instance_from_path,
+    show_solve_status,
+    solve_instance,
+)
+from standard_form import write_standard_form
 from transform import transform_instance
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -17,17 +24,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 def _write_std(path: Path, A: np.ndarray, b: np.ndarray, c: np.ndarray) -> None:
     sparse = csr_matrix(A, dtype=np.float64)
-    with path.open("wb") as stream:
-        np.savez_compressed(
-            stream,
-            c=c,
-            b=b,
-            A_data=sparse.data,
-            A_indices=sparse.indices,
-            A_indptr=sparse.indptr,
-            A_shape=np.array(sparse.shape),
-            obj_offset=np.array(0.0),
-        )
+    write_standard_form(path, c, b, sparse)
 
 
 @pytest.mark.parametrize("stem", ["surviving_mixed", "surviving_range"])
@@ -121,6 +118,65 @@ def test_solve_result_recovers_from_corrupt_existing_json(tmp_path: Path) -> Non
     _solve_instance_from_path(std_path)
     data = json.loads(std_path.with_suffix(".data").read_text())
     assert data["solve_status_std"] in ("ok", "ok_ipm")
+
+
+def test_solve_ignores_corrupt_optional_obj_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    std_path = tmp_path / "corrupt_offset.std"
+    _write_std(std_path, np.eye(2), np.ones(2), np.ones(2))
+    real_load = standard_form.np.load
+
+    class CorruptOffsetArchive:
+        def __init__(self, archive):
+            self.archive = archive
+
+        def __enter__(self):
+            self.archive.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.archive.__exit__(*args)
+
+        def __contains__(self, key):
+            return key in self.archive
+
+        def __getitem__(self, key):
+            if key == "obj_offset":
+                raise zipfile.BadZipFile("corrupt optional member")
+            return self.archive[key]
+
+    monkeypatch.setattr(
+        standard_form.np,
+        "load",
+        lambda *args, **kwargs: CorruptOffsetArchive(real_load(*args, **kwargs)),
+    )
+    _solve_instance_from_path(std_path)
+    data = json.loads(std_path.with_suffix(".data").read_text())
+    assert data["solve_status_std"] in ("ok", "ok_ipm")
+
+
+def test_show_solve_status_accepts_ok_ipm_and_unhashable_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name, data in {
+        "ipm": {"solve_status_std": "ok_ipm"},
+        "unhashable": {"solve_status_std": []},
+    }.items():
+        instance_dir = tmp_path / "cls" / name
+        instance_dir.mkdir(parents=True)
+        (instance_dir / f"{name}.data").write_text(json.dumps(data))
+
+    show_solve_status(["cls"], format="std", cache_dir=tmp_path)
+    assert "std: 1/2" in capsys.readouterr().out
+
+
+def test_fresh_solve_ledger_writes_runtime_before_status(tmp_path: Path) -> None:
+    std_path = tmp_path / "ordered.std"
+    _merge_solve_result(std_path, "ok", 1.25)
+    assert std_path.with_suffix(".data").read_text() == (
+        '{"runtime_highs_std": 1.25, "solve_status_std": "ok"}'
+    )
 
 
 def test_solve_instance_file_not_found(tmp_path: Path) -> None:
