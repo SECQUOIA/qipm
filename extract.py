@@ -2,7 +2,9 @@
 """Clone simplex-benchmarks with Git LFS, extract data into cache_dir, then remove the temp clone."""
 
 import argparse
+from datetime import datetime, timezone
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -39,6 +41,35 @@ ZIP_BY_FILENAME = ("clq_mis_vc_dimacs", "clq_mis_vc_random")
 
 EVAL_SUBDIRS = ("easy_steepest", "hard_steepest")
 EVAL_ROOT = Path("benchmark/01_evaluation")
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as tmp:
+            tmp_name = tmp.name
+            tmp.write(content)
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, path)
+    finally:
+        if tmp_name is not None and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    _atomic_write_bytes(path, json.dumps(data, indent=None).encode())
+
+
+def _contained_path(root: Path, *parts: str) -> Path:
+    """Resolve a destination and reject names that escape the cache root."""
+    root = root.resolve()
+    destination = root.joinpath(*parts).resolve()
+    if not destination.is_relative_to(root):
+        raise ValueError(f"Archive-derived path escapes cache root: {destination}")
+    return destination
 
 
 def _cache_class_and_stem_from_file_path(file_path: str) -> tuple[str, str] | None:
@@ -90,9 +121,8 @@ def _copy_zip_mps_to_cache(zip_path: Path, cache_path: Path, cache_class: str) -
                 continue
             name = Path(info.filename).name
             stem = Path(info.filename).stem
-            dest = cache_path / cache_class / stem / name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(zf.read(info.filename))
+            dest = _contained_path(cache_path, cache_class, stem, name)
+            _atomic_write_bytes(dest, zf.read(info.filename))
 
 
 def _copy_zip_mps_by_filename(zip_path: Path, cache_path: Path) -> None:
@@ -108,9 +138,8 @@ def _copy_zip_mps_by_filename(zip_path: Path, cache_path: Path) -> None:
             cache_class = _class_from_filename(filename)
             if cache_class is None:
                 continue
-            dest = cache_path / cache_class / stem / filename
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(zf.read(info.filename))
+            dest = _contained_path(cache_path, cache_class, stem, filename)
+            _atomic_write_bytes(dest, zf.read(info.filename))
 
 
 def _write_data_files_from_evaluation(clone_path: Path, cache_path: Path) -> None:
@@ -147,12 +176,17 @@ def _write_data_files_from_evaluation(clone_path: Path, cache_path: Path) -> Non
                         cache_class, stem = resolved
                         if stem.lower().endswith(".zip"):
                             continue
-                        instance_dir = cache_path / cache_class / stem
+                        instance_dir = _contained_path(cache_path, cache_class, stem)
                         instance_dir.mkdir(parents=True, exist_ok=True)
-                        data_path = instance_dir / f"{stem}.data"
-                        data_path.write_text(
-                            json.dumps({"runtime_glpk": runtime_primal}, indent=None)
-                        )
+                        data_path = _contained_path(instance_dir, f"{stem}.data")
+                        try:
+                            existing = json.loads(data_path.read_text()) if data_path.exists() else {}
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            existing = {}
+                        if not isinstance(existing, dict):
+                            existing = {}
+                        existing["runtime_glpk"] = runtime_primal
+                        _atomic_write_json(data_path, existing)
 
 
 def extract(clone_path: Path, cache_path: Path) -> None:
@@ -235,6 +269,20 @@ def main() -> int:
         )
 
         extract(clone_path, cache_path)
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=clone_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        _atomic_write_json(
+            cache_path / "extract_manifest.json",
+            {
+                "commit": commit,
+                "extracted_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
     finally:
         if args.keep_temp:
             print(f"Kept temporary clone at: {clone_path}", file=sys.stderr)

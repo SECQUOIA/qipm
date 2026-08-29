@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -29,12 +32,13 @@ def _lp_to_standard_form(
     a_start: np.ndarray,
     a_index: np.ndarray,
     a_value: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, csr_matrix]:
+    obj_offset: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, csr_matrix, float]:
     """Convert HiGHS LP (col_lower <= x <= col_upper, row_lower <= Ax <= row_upper) to standard form.
 
     Standard form: min c'x  s.t.  Ax = b,  x >= 0.
 
-    Returns (c, b, A) with A in CSR sparse format.
+    Returns (c, b, A, obj_offset) with A in CSR sparse format.
     """
     inf = _HIGHS_INF
     # Convert to numpy arrays once (avoid repeated conversion in caller)
@@ -64,6 +68,7 @@ def _lp_to_standard_form(
     extra_col_list: list[int] = []
     extra_val_list: list[float] = []
     row_constant = np.zeros(num_row, dtype=np.float64)
+    objective_constant = float(obj_offset)
 
     def add_var(cost: float) -> int:
         nonlocal new_col_count
@@ -83,6 +88,7 @@ def _lp_to_standard_form(
         row_vals = a_value[beg:end]
 
         if lj > -inf and uj < inf:
+            objective_constant += cj * lj
             j1 = add_var(cj)
             j2 = add_var(0.0)
             width = uj - lj
@@ -106,6 +112,7 @@ def _lp_to_standard_form(
             continue
 
         if lj > -inf and uj >= inf:
+            objective_constant += cj * lj
             j1 = add_var(cj)
             for idx in range(len(row_ind)):
                 i = row_ind[idx]
@@ -118,6 +125,7 @@ def _lp_to_standard_form(
                 row_constant[i] += v * lj
             continue
         if lj <= -inf and uj < inf:
+            objective_constant += cj * uj
             j1 = add_var(-cj)
             for idx in range(len(row_ind)):
                 i = row_ind[idx]
@@ -204,17 +212,122 @@ def _lp_to_standard_form(
         col_arr[n1:] = extra_col_list
         val_arr[n1:] = extra_val_list
         A_std = csr_matrix((val_arr, (row_arr, col_arr)), shape=(m_std, n_std))
-    return c_std, b_std, A_std
+    return c_std, b_std, A_std, objective_constant
 
 
-def _transform_instance_from_path(path: Path) -> None:
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Atomically replace a JSON file with data."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as tmp:
+            tmp_name = tmp.name
+            json.dump(data, tmp, indent=None)
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, path)
+    finally:
+        if tmp_name is not None and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+_DOWNSTREAM_DATA_KEYS = (
+    "cycle_count_mnes",
+    "cycle_count_oss",
+    "sparsity_mnes",
+    "sparsity_oss",
+    "cond_mnes",
+    "cond_oss",
+    "status_mnes",
+    "status_oss",
+    "runtime_highs_std",
+    "solve_status_std",
+)
+
+
+def _read_data_object(data_path: Path) -> dict:
+    """Read a JSON object, treating corrupt or non-object data as empty."""
+    try:
+        data = json.loads(data_path.read_text()) if data_path.exists() else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _merge_transform_status(path: Path, status: str, *, retract: bool = False) -> None:
+    data_path = path.with_suffix(".data")
+    data = _read_data_object(data_path)
+    if retract:
+        for key in _DOWNSTREAM_DATA_KEYS:
+            data.pop(key, None)
+    data["transform_status"] = status
+    _atomic_write_json(data_path, data)
+
+
+def _purge_downstream_data(path: Path) -> None:
+    """Atomically retract results derived from an earlier standard form."""
+    data_path = path.with_suffix(".data")
+    data = _read_data_object(data_path)
+    for key in _DOWNSTREAM_DATA_KEYS:
+        data.pop(key, None)
+    _atomic_write_json(data_path, data)
+
+
+def _withhold_standard_form(path: Path, status: str) -> None:
+    _merge_transform_status(path, status, retract=True)
+    path.with_suffix(".std").unlink(missing_ok=True)
+
+
+def _atomic_write_std(path: Path, **arrays: np.ndarray | float) -> None:
+    """Atomically write a compressed NPZ using the requested .std filename."""
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as tmp:
+            tmp_name = tmp.name
+            np.savez_compressed(tmp, **arrays)
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, path)
+    finally:
+        if tmp_name is not None and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def _std_matches(path: Path, arrays: dict[str, np.ndarray | float]) -> bool:
+    """Return whether an existing .std contains exactly the produced arrays."""
+    if not path.is_file():
+        return False
+    try:
+        with np.load(path, allow_pickle=False) as existing:
+            return all(
+                key in existing.files and np.array_equal(existing[key], np.asarray(value))
+                for key, value in arrays.items()
+            )
+    except Exception:  # noqa: BLE001 - unreadable existing output must be replaced
+        return False
+
+
+def _strip_zero_rows(A: csr_matrix, b: np.ndarray) -> tuple[csr_matrix, np.ndarray] | None:
+    """Drop harmless zero rows, returning None when a zero row has nonzero RHS."""
+    row_nnz = np.diff(A.indptr)
+    zero_rows = row_nnz == 0
+    if np.any(zero_rows & (np.abs(b) > 1e-9)):
+        return None
+    keep = ~zero_rows
+    if not keep.all():
+        return A[keep], b[keep]
+    return A, b
+
+
+def _transform_instance_impl(path: Path) -> bool | None:
     """Read MPS file at path, presolve with HiGHS, convert to standard form, and save .std next to it."""
     path = path.resolve()
     if not path.is_file():
         raise FileNotFoundError(f"MPS file not found: {path}")
     if path.stat().st_size == 0:
-        warnings.warn(f"Skipping empty file: {path}", stacklevel=2)
-        return
+        raise RuntimeError(f"MPS file is empty: {path}")
 
     h = highspy.Highs()
     h.setOptionValue("log_to_console", False)
@@ -224,53 +337,98 @@ def _transform_instance_from_path(path: Path) -> None:
     elif status != highspy.HighsStatus.kOk:
         raise RuntimeError(f"HiGHS readModel failed: {status}")
 
+    original_lp = h.getLp()
+    if original_lp.sense_ == highspy.ObjSense.kMaximize:
+        raise RuntimeError(f"Maximization model is not supported: {path}")
+    integrality = getattr(original_lp, "integrality_", None)
+    if integrality and any(v != highspy.HighsVarType.kContinuous for v in integrality):
+        raise RuntimeError(f"Non-continuous variables are not supported: {path}")
+
     status = h.presolve()
     if status == highspy.HighsStatus.kWarning:
         warnings.warn(f"HiGHS presolve returned kWarning for {path}", stacklevel=2)
     elif status != highspy.HighsStatus.kOk:
         raise RuntimeError(f"HiGHS presolve failed: {status}")
 
-    # After presolve(), the incumbent model in HiGHS is the presolved LP.
-    lp = h.getLp()
+    presolve_status = h.getModelPresolveStatus()
+    model_status = h.getModelStatus()
+    if presolve_status == highspy.HighsPresolveStatus.kReducedToEmpty:
+        _withhold_standard_form(path, "reduced_to_empty")
+        return
+    if (
+        presolve_status == highspy.HighsPresolveStatus.kInfeasible
+        or model_status == highspy.HighsModelStatus.kInfeasible
+    ):
+        _withhold_standard_form(path, "infeasible")
+        return
+    if (
+        presolve_status == highspy.HighsPresolveStatus.kUnboundedOrInfeasible
+        or model_status == highspy.HighsModelStatus.kUnboundedOrInfeasible
+    ):
+        _withhold_standard_form(path, "unbounded_or_infeasible")
+        return
+    if model_status == highspy.HighsModelStatus.kUnbounded:
+        _withhold_standard_form(path, "unbounded")
+        return
+    if presolve_status not in (
+        highspy.HighsPresolveStatus.kReduced,
+        highspy.HighsPresolveStatus.kNotReduced,
+    ):
+        raise RuntimeError(f"Unexpected HiGHS presolve status: {presolve_status}")
+
+    lp = h.getPresolvedLp()
     if lp is None or (lp.num_col_ == 0 and lp.num_row_ == 0):
-        raise RuntimeError("HiGHS presolved LP not available or empty")
+        _withhold_standard_form(path, "reduced_to_empty")
+        return
 
     num_col = lp.num_col_
     num_row = lp.num_row_
     a = lp.a_matrix_
-    c, b, A = _lp_to_standard_form(
+    c, b, A, obj_offset = _lp_to_standard_form(
         num_col, num_row,
         lp.col_cost_, lp.col_lower_, lp.col_upper_,
         lp.row_lower_, lp.row_upper_,
         a.start_, a.index_, a.value_,
+        lp.offset_,
     )
 
-    # Strip zero rows from the standard form.
-    # Real-world MPS files (netlib, stochlp, misc, miplib, max_flow) commonly
-    # contain ghost equality rows: declared in ROWS as "E" but never referenced
-    # in COLUMNS or RHS, producing "0 = 0" constraints that survive presolve
-    # unchanged.  After _lp_to_standard_form these become all-zero rows with
-    # b[i] = 0, making A rank-deficient by the ghost count.  Dropping them is
-    # safe: they impose no constraint and only harm the condition-number estimate.
-    row_nnz = np.diff(A.indptr)
-    keep = row_nnz > 0
-    if not keep.all():
-        A = A[keep]
-        b = b[keep]
+    # Presolve normally removes empty rows. Keep this as defensive handling for
+    # harmless 0 = 0 rows that a solver version or input edge case may retain.
+    stripped = _strip_zero_rows(A, b)
+    if stripped is None:
+        _withhold_standard_form(path, "infeasible")
+        return
+    A, b = stripped
 
+    arrays = {
+        "c": c,
+        "b": b,
+        "A_data": A.data,
+        "A_indices": A.indices,
+        "A_indptr": A.indptr,
+        "A_shape": np.array(A.shape),
+        "obj_offset": np.array(obj_offset, dtype=np.float64),
+    }
     out_std = path.with_suffix(".std")
-    # savez_compressed appends .npz if missing; write to .npz then rename to .std
-    out_npz = path.with_suffix(".npz")
-    np.savez_compressed(
-        str(out_npz),
-        c=c,
-        b=b,
-        A_data=A.data,
-        A_indices=A.indices,
-        A_indptr=A.indptr,
-        A_shape=np.array(A.shape),
-    )
-    out_npz.rename(out_std)
+    changed = not _std_matches(out_std, arrays)
+    if changed:
+        _purge_downstream_data(path)
+        _atomic_write_std(out_std, **arrays)
+    return changed
+
+
+def _transform_instance_from_path(path: Path) -> None:
+    """Transform one discovered MPS path, retracting stale outputs on failure."""
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"MPS file not found: {path}")
+    try:
+        changed = _transform_instance_impl(path)
+    except Exception as exc:
+        _withhold_standard_form(path, f"error:{type(exc).__name__}")
+        raise
+    if changed is not None:
+        _merge_transform_status(path, "ok")
 
 
 def transform_instance(
@@ -313,7 +471,13 @@ def transform_instance_class(
 
     subdirs = sorted(d for d in folder.iterdir() if d.is_dir())
     for subdir in tqdm(subdirs, desc=instance_class, unit="instance"):
-        transform_instance(instance_class, subdir.name, cache_dir=root)
+        if not any(subdir.glob("*.mps")):
+            tqdm.write(f"skipping {subdir.name}: no .mps file")
+            continue
+        try:
+            transform_instance(instance_class, subdir.name, cache_dir=root)
+        except Exception as exc:  # noqa: BLE001 - isolate corpus instances
+            tqdm.write(f"skipping {subdir.name}: {exc}")
 
 
 def transform_all_instance_classes(
@@ -368,15 +532,36 @@ def clear_std_files(
     instance_classes: list[str] | None = None,
     cache_dir: str | Path | None = None,
 ) -> None:
-    """Delete all .std files under cache_dir (or a subset of instance classes)."""
+    """Delete .std files and purge their transform, solve, and benchmark data."""
     root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Cache directory not found: {root}")
 
     search_roots = [root / name for name in instance_classes] if instance_classes else [root]
     for search_root in search_roots:
-        for f in search_root.rglob("*.std"):
-            f.unlink()
+        instance_dirs = {
+            path.parent
+            for pattern in ("*.std", "*.data")
+            for path in search_root.rglob(pattern)
+        }
+        for instance_dir in sorted(instance_dirs, key=str):
+            for data_path in instance_dir.glob("*.data"):
+                invalid_data = False
+                try:
+                    data = json.loads(data_path.read_text())
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    data = {}
+                    invalid_data = True
+                if not isinstance(data, dict):
+                    data = {}
+                    invalid_data = True
+                keys = ("transform_status",) + _DOWNSTREAM_DATA_KEYS
+                if invalid_data or any(key in data for key in keys):
+                    for key in keys:
+                        data.pop(key, None)
+                    _atomic_write_json(data_path, data)
+            for std_path in instance_dir.glob("*.std"):
+                std_path.unlink()
 
 
 if __name__ == "__main__":

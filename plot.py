@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +55,23 @@ _RCPARAMS = {
 }
 
 
+def _finite_number(value: object, *, positive: bool = False) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    numeric = float(value)
+    return math.isfinite(numeric) and (numeric > 0 if positive else numeric >= 0)
+
+
+def _difficulty_bins(values: np.ndarray) -> np.ndarray:
+    positive = values[np.isfinite(values) & (values > 0)]
+    value_min = float(positive.min())
+    value_max = float(positive.max())
+    if value_min == value_max:
+        value_min /= 1.1
+        value_max *= 1.1
+    return np.logspace(np.log10(value_min), np.log10(value_max), N_BINS + 1)
+
+
 # ---------------------------------------------------------------------------
 # Shared data loading
 # ---------------------------------------------------------------------------
@@ -73,9 +91,11 @@ def _iter_records(instance_classes: list[str], cache_dir: Path) -> dict[str, lis
             if not data_path.exists():
                 continue
             try:
-                records.append(json.loads(data_path.read_text()))
-            except (json.JSONDecodeError, OSError):
+                record = json.loads(data_path.read_text())
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
+            if isinstance(record, dict):
+                records.append(record)
         if records:
             result[cls] = records
     return result
@@ -96,8 +116,11 @@ def _load_advantage_data(
     for cls, records in all_records.items():
         filtered = [
             r for r in records
-            if r.get(runtime_key)
-            and (r.get("cycle_count_mnes") is not None or r.get("cycle_count_oss") is not None)
+            if _finite_number(r.get(runtime_key))
+            and (
+                _finite_number(r.get("cycle_count_mnes"), positive=True)
+                or _finite_number(r.get("cycle_count_oss"), positive=True)
+            )
         ]
         if filtered:
             result[cls] = filtered
@@ -107,7 +130,7 @@ def _load_advantage_data(
 def _cycle_counts(records: list[dict], variant: str) -> np.ndarray | None:
     """Extract cycle counts for a single variant ('mnes' or 'oss')."""
     key = "cycle_count_" + _VARIANT_SUFFIX[variant]
-    vals = [r[key] for r in records if r.get(key) is not None]
+    vals = [r[key] for r in records if _finite_number(r.get(key), positive=True)]
     return np.array(vals, dtype=np.float64) if vals else None
 
 
@@ -124,7 +147,8 @@ def _truncate_at_zero(
 ) -> tuple[np.ndarray, np.ndarray]:
     zero_idx = np.argmax(curve == 0.0)
     if curve[zero_idx] == 0.0:
-        return t_values[: zero_idx + 1], curve[: zero_idx + 1]
+        end = max(2, zero_idx + 1)
+        return t_values[:end], curve[:end]
     return t_values, curve
 
 
@@ -142,6 +166,18 @@ def plot_advantage(
         return
 
     variants = list(_VARIANT_SUFFIX) if variant == "both" else [variant]
+    if variant == "both":
+        complete = {}
+        for cls, records in data.items():
+            selected = [
+                record
+                for record in records
+                if _finite_number(record.get("cycle_count_mnes"), positive=True)
+                and _finite_number(record.get("cycle_count_oss"), positive=True)
+            ]
+            if selected:
+                complete[cls] = selected
+        data = complete
 
     all_cts: list[np.ndarray] = []
     for cls, records in data.items():
@@ -150,7 +186,10 @@ def plot_advantage(
             if gc is None:
                 continue
             key = "cycle_count_" + _VARIANT_SUFFIX[v]
-            hrs = np.array([r[runtime_key] for r in records if r.get(key) is not None], dtype=np.float64)
+            hrs = np.array(
+                [r[runtime_key] for r in records if _finite_number(r.get(key), positive=True)],
+                dtype=np.float64,
+            )
             if len(gc) == len(hrs) and len(gc) > 0:
                 all_cts.append(_crossover_times(gc, hrs))
 
@@ -159,7 +198,12 @@ def plot_advantage(
         return
 
     combined = np.concatenate(all_cts)
-    x_min = max(1e-28, float(combined.min()))
+    combined = combined[np.isfinite(combined) & (combined >= 0)]
+    if combined.size == 0:
+        print("No finite crossover times for the requested variant.")
+        return
+    positive = combined[combined > 0]
+    x_min = max(1e-28, float(positive.min())) if positive.size else 1e-28
     x_max = max(float(combined.max()), GATE_SPEED_RECORD) * 10
     t_values = np.geomspace(x_min, x_max, N_POINTS)
 
@@ -174,14 +218,23 @@ def plot_advantage(
 
     fig, ax = plt.subplots(figsize=(10, 5))
     fallback_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    sorted_classes = sorted(data.keys(), key=str.lower)
+    class_colors = {
+        cls: CLASS_COLORS.get(cls, fallback_colors[i % len(fallback_colors)])
+        for i, cls in enumerate(sorted_classes)
+    }
 
     linestyles = {"mnes": "-", "oss": "--"}
 
-    for i, (cls, records) in enumerate(data.items()):
-        color = CLASS_COLORS.get(cls, fallback_colors[i % len(fallback_colors)])
+    for cls, records in data.items():
+        color = class_colors[cls]
         for v in variants:
             key = "cycle_count_" + _VARIANT_SUFFIX[v]
-            pairs = [(r, r[runtime_key]) for r in records if r.get(key) is not None]
+            pairs = [
+                (r, r[runtime_key])
+                for r in records
+                if _finite_number(r.get(key), positive=True)
+            ]
             if not pairs:
                 continue
             gc = np.array([r[key] for r, _ in pairs], dtype=np.float64)
@@ -210,11 +263,11 @@ def plot_advantage(
 
     class_handles = [
         mpatches.Patch(
-            facecolor=CLASS_COLORS.get(cls, fallback_colors[i % len(fallback_colors)]),
+            facecolor=class_colors[cls],
             edgecolor="none",
             label=CLASS_LABELS.get(cls, cls),
         )
-        for i, cls in enumerate(sorted(data.keys(), key=str.lower))
+        for cls in sorted_classes
     ]
     fig.legend(
         handles=class_handles,
@@ -260,9 +313,11 @@ def _load_difficulty_data(
         for r in records:
             s = r.get(sparsity_key)
             k = r.get(cond_key)
-            if s is None or k is None:
+            if not _finite_number(s, positive=True) or not _finite_number(k, positive=True):
                 continue
-            values.append(float(s) * float(k))
+            product = float(s) * float(k)
+            if math.isfinite(product) and product > 0:
+                values.append(product)
         if values:
             result[cls] = np.array(values, dtype=np.float64)
     return result
@@ -282,8 +337,9 @@ def plot_difficulty(
         return
 
     all_values = np.concatenate(list(data.values()))
-    pos = all_values[all_values > 0]
-    bins = np.logspace(np.log10(pos.min()), np.log10(pos.max()), N_BINS + 1)
+    pos = all_values[np.isfinite(all_values) & (all_values > 0)]
+    bins = _difficulty_bins(pos)
+    lower, upper = float(bins[0]), float(bins[-1])
 
     plt.rcParams.update(_RCPARAMS)
 
@@ -300,9 +356,8 @@ def plot_difficulty(
         linewidth=0.4,
     )
 
-    x_max = 1e19 if variant == "mnes" else 1e10
     ax.set_xscale("log")
-    ax.set_xlim(right=x_max)
+    ax.set_xlim(lower, upper)
     if y_max is not None:
         ax.set_ylim(top=y_max)
     ax.set_xlabel(r"difficulty $\gamma = s \cdot \kappa$", fontsize=11, labelpad=8)
@@ -377,8 +432,7 @@ if __name__ == "__main__":
                 if not vdata:
                     continue
                 all_vals = np.concatenate(list(vdata.values()))
-                pos = all_vals[all_vals > 0]
-                bins = np.logspace(np.log10(pos.min()), np.log10(pos.max()), N_BINS + 1)
+                bins = _difficulty_bins(all_vals)
                 stacked = np.zeros(N_BINS, dtype=np.float64)
                 for cls in sorted(vdata.keys(), key=lambda c: float(np.median(vdata[c]))):
                     c, _ = np.histogram(vdata[cls], bins=bins)

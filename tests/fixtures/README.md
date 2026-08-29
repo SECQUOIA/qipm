@@ -1,6 +1,6 @@
 # Transform test fixtures (MPS → presolve → standard form)
 
-Each `.mps` file has a pre-created reference `.std` (standard form c, b, A). Tests compare `transform_instance` output to these references.
+The legacy small fixtures and reference `.std` files document individual MPS constructs. HiGHS presolves most of them to empty, so they are no longer used as golden pipeline outputs.
 
 | Fixture         | Purpose                                                            |
 |-----------------|--------------------------------------------------------------------|
@@ -12,5 +12,7 @@ Each `.mps` file has a pre-created reference `.std` (standard form c, b, A). Tes
 | **free_var**    | One FR (free) variable → x = x⁺ − x⁻ branch                        |
 | **upper_var**   | One variable with MI + UP (upper-only column branch)               |
 | **range_row**   | L row + RANGES → row with finite lo < hi (range constraint branch) |
+| **surviving_mixed** | Mixed row and bound types that empirically survive HiGHS presolve |
+| **surviving_range** | Dense full-row-rank LP that empirically survives HiGHS presolve |
 
-These cover the main branches in `_lp_to_standard_form`: column types (bounded, lower-only, upper-only, free) and row types (equality, ≤, ≥, range).
+Tests use the two surviving fixtures for objective-oracle and end-to-end checks, and an old fixture for the `reduced_to_empty` path. Pure-function tests cover every column branch (including fixed variables) and row branch directly instead of trusting golden NPZ files.

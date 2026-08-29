@@ -31,8 +31,10 @@ Each stage writes results into `cache_dir/<class>/<name>/`:
 | File | Contents |
 |------|----------|
 | <name>.mps | Original MPS file |
-| <name>.std | Standard-form LP (NPZ: sparse `A`, vectors `b`, `c`) |
+| <name>.std | Standard-form LP (NPZ: sparse `A`, vectors `b`, `c`, scalar `obj_offset`) |
 | <name>.data | JSON accumulating cycle counts, sparsity, condition numbers, runtimes |
+
+Results accumulate across stages. Re-running transform when the decompressed `.std` arrays are unchanged preserves downstream results; generating different arrays purges those fields before replacing `.std`, and removing `.std` clears them as well.
 
 Instance classes: `clique`, `independent_set`, `max_flow`, `miplib`, `misc`, `netlib`, `stochlp`, `vertex_cover`.
 
@@ -59,7 +61,7 @@ Two types of data are extracted:
 | max_flow, random_directed_graphs | max_flow |
 | clq_mis_vc_dimacs, clq_mis_vc_random | by filename prefix: `clq`→clique, `is`→independent_set, `vc`→vertex_cover |
 
-**GLPK runtimes** — the evaluation results in `benchmark/01_evaluation/` contain compressed archives of `.data` files with per-instance GLPK solve times (`runtime_primal`). These are extracted and written as `{"runtime_glpk": ...}` into each instance's `.data` file.
+**GLPK runtimes** — the evaluation results in `benchmark/01_evaluation/` contain compressed archives of `.data` files with per-instance GLPK solve times (`runtime_primal`). These are merged into each instance's `.data` file as `runtime_glpk`, preserving results from other stages. Fresh clones also produce `cache_dir/extract_manifest.json` with the source commit and extraction time.
 
 ### 2. Transform
 
@@ -88,7 +90,9 @@ Each MPS file is first presolved by HiGHS, then the reduced LP is algebraically 
 | Range $l \leq Ax \leq u$ | Add slack for upper bound; extra row $s_1 + s_2 = u - l$ |
 | Free row | Dropped entirely |
 
-After conversion, zero rows (ghost equality rows that survive presolve unreferenced) are removed, as they make $A$ rank-deficient without adding any constraint. The result is saved as a compressed NPZ file with extension `.std`.
+After conversion, harmless zero rows with zero right-hand sides are removed. A zero row with a nonzero right-hand side is recorded as infeasible. The result is saved as a compressed NPZ file with extension `.std`. Variable shifts and the original MPS objective offset are stored as `obj_offset`, so $z_{\mathrm{mps}} = z_{\mathrm{std}} + \mathtt{obj\_offset}$.
+
+The transform stage writes `transform_status` (`ok`, `reduced_to_empty`, `infeasible`, `unbounded`, `unbounded_or_infeasible`, or `error:<ExceptionName>`) to `.data`. An unchanged successful transform preserves downstream results. A changed successful transform clears them; every non-success conversion outcome removes a stale `.std` and clears them.
 
 ### 3. Solve (optional)
 
@@ -110,6 +114,8 @@ Each instance is solved in two independent modes, controlled by `--format`:
 For `.std`, if the default solver fails (e.g. due to poor scaling), the solve is automatically retried with HiGHS's interior-point method.
 
 Each solve runs in a subprocess with a 10-minute timeout. In `both` mode, if the `.mps` solve times out, the `.std` solve is skipped for that instance. Wall-clock solve times are written to the instance's `.data` JSON and serve as the classical baseline for the quantum advantage comparison.
+
+`solve_status_mps` and `solve_status_std` record `ok`, `ok_ipm`, `timeout`, `crashed`, `non_optimal`, or `error:<ExceptionName>`. Runtime keys are present only for optimal solves.
 
 ### 4. Benchmark
 
@@ -133,9 +139,11 @@ Two QIPM variants are benchmarked:
 
 For each instance, the script reads $A$ from the `.std` file and writes three keys per variant into the instance's `.data` JSON: the cycle count (`cycle_count_mnes` / `cycle_count_oss`), the sparsity parameter $s$ (`sparsity_mnes` / `sparsity_oss`), and the condition number $\kappa$ (`cond_mnes` / `cond_oss`).
 
+`status_mnes` and `status_oss` record `ok`, `timeout`, `crashed`, `skipped_too_large`, `skipped_degenerate`, `rank_uncertain`, or `error:<ExceptionName>`. Instances with more than 100,000 rows are recorded as `skipped_too_large`.
+
 **Basis preprocessing** — shared by both variants: SPQR (column-pivoted QR on $A$) selects a basis $B$ of size $m$ and identifies the non-basic columns $N$. If $A$ is rank-deficient, a secondary SPQR on $A^\top$ drops redundant rows. A sparse LU factorisation of $A_B$ is then computed once and reused by both variants for all subsequent triangular solves.
 
-**Condition estimation** — both condition numbers are computed matrix-free via ARPACK on `LinearOperator` objects and are **lower bounds** on the true $\kappa$. `svds("LM")` Ritz values underestimate $\sigma_\max$; `svds("SM")` Ritz values overestimate $\sigma_\min$; their ratio is therefore a lower bound on the true condition number. When `svds("SM")` does not converge within a 60-second wall-clock timeout, $\sigma_\min$ is upper-bounded by the minimum of $\|Mw\|$ (or $\|\bar{F}w\|$) over 10k random unit vectors $w$ — valid by the min-max theorem — preserving the lower bound guarantee.
+**Condition estimation** — both condition numbers are computed matrix-free via ARPACK on `LinearOperator` objects and are **lower bounds** on the true $\kappa$. `svds("LM")` Ritz values underestimate $\sigma_\max$; `svds("SM")` Ritz values overestimate $\sigma_\min$; their ratio is therefore a lower bound on the true condition number. On timeout, random probes provide a lower bound on $\sigma_\max$ or an upper bound on $\sigma_\min$. MNES uses left probes $\|\bar{F}^{\top}u\|$ for the latter; OSS uses $\|Mw\|$. These directions preserve the lower-bound guarantee for $\kappa$.
 
 #### MNES — `mnes`
 
@@ -153,13 +161,25 @@ $$s = \max\!\bigl(\underbrace{\text{max row-nnz}(A)}_{\text{z}_y\text{ columns}}
 
 The $\mathrm{z}_y$ columns equal the columns of $-A^\top$ (nnz of column $j$ = nnz of row $j$ of $A$). The $\mathrm{z}_\lambda$ columns each have $m$ nonzeros in the $B$-rows (from the dense $A_B^{-1}A_N$ column) plus one in the $N$-rows. The $B$-rows dominate among rows: each $B$-row $i$ has $\mathrm{col\text{-}nnz}_i(A)$ entries from $-A^\top$ plus $n_N$ dense entries from $V_{B,:} = -A_B^{-1}A_N$; $N$-rows have only one nonzero from $V$ and are dominated by the other terms.
 
-**Cycle count formula** — a single QLSA call costs $\mathcal{Q}=$`cycle_count_qlsa(s, κ, ε)` cycles (Chebyshev query count). At least $(d-1)/\varepsilon^2$ measurements, hence that many repetitions of the QLSA, are required in order to obtain an approximate classical solution. The total cycle count is therefore
+When $n_N=0$, MNES uses the exact special case $s=1$; OSS has no $m+1$ null-space-column term and uses the maximum row or column nnz of $A$.
+
+**Cycle count formula** — a single QLSA call costs $\mathcal{Q}=$`cycle_count_qlsa(s, κ, ε)` cycles (Chebyshev query count). The total cycle count is
 
 $$
-\text{cycle count} = \mathcal{Q}\times\frac{\dim-1}{\varepsilon^2}
+\text{cycle count} = \mathcal{Q}\times
+\begin{cases}
+\left\lceil(m-1)/\varepsilon^2\right\rceil & \text{MNES},\\
+\left\lceil(2n-1)/\varepsilon^2\right\rceil & \text{OSS}.
+\end{cases}
 $$
 
-where $\dim = m$ (MNES) or $\dim = n$ (OSS), and $\varepsilon = 0.1$.
+OSS uses the larger factor because of its Hermitian dilation. The required repetition count is rounded up, and $\varepsilon = 0.1$.
+
+### 5. Plot
+
+`plot.py` produces advantage curves and difficulty histograms from `.data`. It enables Matplotlib's LaTeX renderer, so a working LaTeX installation is required in addition to the Python packages.
+
+The cache pipeline assumes a single writer per instance; do not run stages concurrently against the same instance directory.
 
 ## Installation
 
@@ -170,7 +190,7 @@ brew install suite-sparse
 pip install -r requirements.txt
 ```
 
-**Dependencies:** `numpy`, `scipy`, `highspy`, `qiskit`, `sparseqr`, `tqdm`.
+**Dependencies:** `numpy`, `scipy`, `highspy`, `sparseqr`, `matplotlib`, `tqdm`.
 
 ## Tests
 

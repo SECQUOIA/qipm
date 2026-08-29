@@ -6,19 +6,55 @@ from __future__ import annotations
 import json
 import math
 import multiprocessing
+import os
 import signal
+import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
+import sparseqr
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
 _EPSILON = 1e-1  # precision shared by QLSA and outer Newton-step count
 _PREPROCESS_TIMEOUT = 600  # seconds; basis preprocessing time limit
 _MNES_SM_TIMEOUT = 60     # seconds; wall-clock limit for svds("SM") in MNES
-_MNES_N_PROBES = 10_000   # random right-probes for σ_min upper bound fallback
+_MNES_N_PROBES = 10_000   # random probes for singular-value fallbacks
 _OSS_SM_TIMEOUT = 60      # seconds; wall-clock limit for svds("SM") in OSS
-_OSS_N_PROBES = 10_000    # random right-probes for σ_min upper bound fallback
+_OSS_N_PROBES = 10_000    # random probes for singular-value fallbacks
+
+
+class RankUncertainError(RuntimeError):
+    """SPQR dropped a row whose dependence could not be certified."""
+
+
+class PreprocessTimeoutError(RuntimeError):
+    """Basis preprocessing exceeded its wall-clock limit."""
+
+
+class PreprocessCrashedError(RuntimeError):
+    """Basis preprocessing worker exited without a usable result."""
+
+
+class DegenerateInstanceError(RuntimeError):
+    """Preprocessing reduced the benchmark system below two rows."""
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as tmp:
+            tmp_name = tmp.name
+            json.dump(data, tmp, indent=None)
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, path)
+    finally:
+        if tmp_name is not None and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 def cycle_count_qlsa(
@@ -38,7 +74,12 @@ def cycle_count_qlsa(
     Returns:
         int: The number of queries that QLS Chebyshev makes to O_H and O_F (P_A).
     """
-    binst = math.ceil(math.log(s * k / epsilon) * (s * k) ** 2)
+    if s <= 0 or k < 1 or epsilon <= 0 or not math.isfinite(k):
+        raise ValueError("s and epsilon must be positive and k must be finite and at least 1")
+    sk = float(s) * k
+    if not math.isfinite(sk) or sk > math.sqrt(np.finfo(np.float64).max):
+        raise OverflowError("s*k is too large for the QLSA cycle-count formula")
+    binst = math.ceil(math.log(sk / epsilon) * sk**2)
     insqrt = binst * math.log(4 * binst / epsilon)
     j0_val = int(math.ceil(math.sqrt(insqrt)))
     return 8 * j0_val
@@ -47,6 +88,7 @@ def cycle_count_qlsa(
 def _preprocess_basis_worker(queue: multiprocessing.Queue, A: csr_matrix) -> None:
     """Subprocess worker for _preprocess_basis; puts result or exception into queue."""
     import sparseqr
+    from scipy.sparse.linalg import lsmr
     try:
         A = csr_matrix(A, dtype=np.float64)
         m, n = A.shape
@@ -55,9 +97,38 @@ def _preprocess_basis_worker(queue: multiprocessing.Queue, A: csr_matrix) -> Non
         basis_P = np.asarray(basis_P, dtype=np.intp)
 
         if effective_rank < m:
-            _, _, P_row, _ = sparseqr.qr(A.T)
+            _, _, P_row, row_rank = sparseqr.qr(A.T)
+            if row_rank != effective_rank:
+                raise RankUncertainError(
+                    f"SPQR rank estimates disagree: {effective_rank} vs {row_rank}"
+                )
             P_row = np.asarray(P_row, dtype=np.intp)
-            A = A[P_row[:effective_rank], :]
+            kept_rows = P_row[:effective_rank]
+            dropped_rows = P_row[effective_rank:m]
+            A_kept = A[kept_rows, :].tocsr()
+            iter_lim = max(100, min(10_000, 10 * max(A_kept.shape)))
+            for row_index in dropped_rows:
+                dropped = A.getrow(int(row_index)).toarray().ravel()
+                try:
+                    solution = lsmr(
+                        A_kept.T,
+                        dropped,
+                        atol=1e-12,
+                        btol=1e-12,
+                        maxiter=iter_lim,
+                    )[0]
+                    residual = np.linalg.norm(A_kept.T @ solution - dropped)
+                except Exception as exc:  # noqa: BLE001 - failed certification is uncertain
+                    raise RankUncertainError(
+                        f"Could not certify SPQR-dropped row {int(row_index)}"
+                    ) from exc
+                relative_residual = residual / max(np.linalg.norm(dropped), np.finfo(float).tiny)
+                if not math.isfinite(relative_residual) or relative_residual > 1e-6:
+                    raise RankUncertainError(
+                        f"SPQR-dropped row {int(row_index)} has relative residual "
+                        f"{relative_residual:.3e}"
+                    )
+            A = A_kept
             m = effective_rank
 
         B = basis_P[:m]
@@ -79,7 +150,6 @@ def _preprocess_basis(A: csr_matrix):
     Raises RuntimeError if preprocessing exceeds _PREPROCESS_TIMEOUT seconds.
     """
     import queue as _queue
-    import time
     from scipy.sparse.linalg import splu
 
     q: multiprocessing.Queue = multiprocessing.Queue()
@@ -94,9 +164,15 @@ def _preprocess_basis(A: csr_matrix):
                 break
             except _queue.Empty:
                 if not p.is_alive():
-                    raise RuntimeError("Basis preprocessing failed (worker process crashed)")
+                    try:
+                        result = q.get_nowait()
+                        break
+                    except _queue.Empty:
+                        raise PreprocessCrashedError(
+                            f"Basis preprocessing worker crashed with exit code {p.exitcode}"
+                        )
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(
+                    raise PreprocessTimeoutError(
                         f"Basis preprocessing exceeded {_PREPROCESS_TIMEOUT // 60}-minute time limit"
                     )
         if isinstance(result, Exception):
@@ -121,8 +197,8 @@ class _AlarmTimeout(Exception):
     pass
 
 
-def _sigma_min_timed(F_op, timeout: int) -> float | None:
-    """Run svds("SM") for σ_min(F̄) with a SIGALRM wall-clock timeout.
+def _sigma_timed(operator, which: str, timeout: int) -> float | None:
+    """Run svds for one extreme singular value with a SIGALRM timeout.
 
     Returns the singular value on convergence, or None on timeout / non-convergence.
     The SIGALRM fires at the next Python callback (i.e. the next F̄ matvec), so
@@ -136,7 +212,7 @@ def _sigma_min_timed(F_op, timeout: int) -> float | None:
     old = signal.signal(signal.SIGALRM, _handler)
     signal.alarm(timeout)
     try:
-        return float(svds(F_op, k=1, which="SM", return_singular_vectors=False)[0])
+        return float(svds(operator, k=1, which=which, return_singular_vectors=False)[0])
     except (_AlarmTimeout, ArpackNoConvergence):
         return None
     finally:
@@ -144,20 +220,41 @@ def _sigma_min_timed(F_op, timeout: int) -> float | None:
         signal.signal(signal.SIGALRM, old)
 
 
-def _sigma_min_random_probes(fbar_mv, n_N: int, n_probes: int) -> float:
+def _sigma_min_random_probes(
+    operator_mv, dimension: int, n_probes: int, timeout: float = 60.0
+) -> float:
     """Upper bound on σ_min(F̄) via random Rayleigh-quotient probes.
 
-    For any unit w ∈ ℝ^{n_N}: σ_min(F̄) ≤ ‖F̄w‖ (min-max theorem).
+    For any unit w: σ_min(F̄) ≤ ‖F̄w‖ (min-max theorem).
     Returns the minimum over n_probes random Gaussian unit vectors — a valid
-    (if potentially loose) upper bound, hence a lower bound on κ(M̂).
+    (if potentially loose) upper bound, hence usable in a condition lower bound.
     """
     rng = np.random.default_rng(0)
     ub = np.inf
+    deadline = time.monotonic() + timeout
     for _ in range(n_probes):
-        w = rng.standard_normal(n_N)
+        w = rng.standard_normal(dimension)
         w /= np.linalg.norm(w)
-        ub = min(ub, float(np.linalg.norm(fbar_mv(w))))
+        ub = min(ub, float(np.linalg.norm(operator_mv(w))))
+        if time.monotonic() >= deadline:
+            break
     return ub
+
+
+def _sigma_max_random_probes(
+    operator_mv, dimension: int, n_probes: int, timeout: float = 60.0
+) -> float:
+    """Lower-bound σ_max using the largest norm among random unit probes."""
+    rng = np.random.default_rng(1)
+    lower_bound = 0.0
+    deadline = time.monotonic() + timeout
+    for _ in range(n_probes):
+        w = rng.standard_normal(dimension)
+        w /= np.linalg.norm(w)
+        lower_bound = max(lower_bound, float(np.linalg.norm(operator_mv(w))))
+        if time.monotonic() >= deadline:
+            break
+    return lower_bound
 
 
 def _cycle_count_mnes_from_basis(
@@ -178,11 +275,14 @@ def _cycle_count_mnes_from_basis(
     When n_N < m, F̄ has rank ≤ n_N < m, so F̄F̄ᵀ has a null space and λ_min = 1
     exactly — no second svds call needed.
     """
-    from scipy.sparse.linalg import LinearOperator, svds
+    from scipy.sparse.linalg import LinearOperator
 
     s = m  # M̂ is generically dense m×m
 
-    if n_N == 0 or m <= 1:
+    if n_N == 0:
+        s = 1
+        k = 1.0
+    elif A_N.nnz == 0 or m <= 1:
         k = 1.0
     else:
         def _fbar_mv(v: np.ndarray) -> np.ndarray:
@@ -198,7 +298,11 @@ def _cycle_count_mnes_from_basis(
             lam_min = 1.0  # n_N = 1 < m → null space of F̄F̄ᵀ is non-trivial
         else:
             F_op = LinearOperator((m, n_N), matvec=_fbar_mv, rmatvec=_fbar_rmv, dtype=np.float64)
-            sigma_max = float(svds(F_op, k=1, which="LM", return_singular_vectors=False)[0])
+            sigma_max = _sigma_timed(F_op, "LM", _MNES_SM_TIMEOUT)
+            if sigma_max is None:
+                sigma_max = _sigma_max_random_probes(
+                    _fbar_mv, n_N, _MNES_N_PROBES, _MNES_SM_TIMEOUT
+                )
             lam_max = 1.0 + sigma_max ** 2
             if n_N < m:
                 # F̄ has rank ≤ n_N < m → λ_min(M̂) = 1 exactly
@@ -209,14 +313,19 @@ def _cycle_count_mnes_from_basis(
                 # giving a lower bound on κ.  On timeout or non-convergence fall
                 # back to random Rayleigh-quotient probes, which are cheaper but
                 # potentially looser upper bounds on σ_min.
-                sigma_min = _sigma_min_timed(F_op, _MNES_SM_TIMEOUT)
+                sigma_min = _sigma_timed(F_op, "SM", _MNES_SM_TIMEOUT)
                 if sigma_min is None:
-                    sigma_min = _sigma_min_random_probes(_fbar_mv, n_N, _MNES_N_PROBES)
+                    # Probe the left side. For unit u, ||Fbar.T u|| is an upper
+                    # bound on the smallest singular value relevant to Fbar Fbar.T.
+                    sigma_min = _sigma_min_random_probes(
+                        _fbar_rmv, m, _MNES_N_PROBES, _MNES_SM_TIMEOUT
+                    )
                 lam_min = 1.0 + sigma_min ** 2
 
-        k = lam_max / lam_min
+        k = max(lam_max / lam_min, 1.0)
 
-    count = int(cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON) * (m - 1) / _EPSILON**2)
+    repetitions = math.ceil((m - 1) / _EPSILON**2)
+    count = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON) * repetitions
     return count, s, k
 
 
@@ -226,7 +335,10 @@ def _cycle_count_mnes(A: csr_matrix) -> tuple[int, int, float]:
     Computes κ(M̂) via M̂ = I + F̄F̄ᵀ, F̄ = A_B⁻¹ A_N (D_B = D_N = I); s = m.
     Uses svds on F̄: κ = (1+σ_max²)/(1+σ_min²); λ_min = 1 exactly when n_N < m.
     """
-    return _cycle_count_mnes_from_basis(*_preprocess_basis(A))
+    basis = _preprocess_basis(A)
+    if basis[1] < 2:
+        raise DegenerateInstanceError("Preprocessing reduced A below two rows")
+    return _cycle_count_mnes_from_basis(*basis)
 
 
 def _cycle_count_oss_from_basis(
@@ -245,9 +357,8 @@ def _cycle_count_oss_from_basis(
     V ∈ ℝⁿˣ⁽ⁿ⁻ᵐ⁾ is the null-space basis built from the SPQR pivot basis B:
         V[B, :] = -A_B⁻¹ A_N,  V[N, :] = I_{n-m}.
 
-    σ_max via svds("LM"); σ_min via svds("SM") with a wall-clock timeout, falling
-    back to random Rayleigh-quotient probes. Ritz bounds from both svds calls
-    guarantee κ = σ_max_ritz / σ_min_ritz is a lower bound on the true κ(M).
+    Both extreme singular-value calls have wall-clock timeouts and fall back to
+    random norm probes whose bound directions preserve a lower bound on κ(M).
 
     Sparsity s = max over rows and columns of M:
     - z_y columns: nnz of column j = nnz of row j of A  → max is max row-nnz(A),
@@ -256,13 +367,16 @@ def _cycle_count_oss_from_basis(
                                                           → max is max_col-nnz(A_B) + n_N,
     - N-rows: col-nnz_i(A) + 1                           → dominated by the terms above.
     """
-    from scipy.sparse.linalg import LinearOperator, svds
+    from scipy.sparse.linalg import LinearOperator
 
     col_nnz = A.getnnz(axis=0)
     s_zy_cols  = int(A.getnnz(axis=1).max()) if A.nnz > 0 else 0  # z_y columns
-    s_zlam_cols = m + 1                                             # z_λ columns
-    s_B_rows   = (int(col_nnz[B].max()) + n_N) if n_N > 0 and len(B) > 0 else 0  # B-rows
-    s = max(s_zy_cols, s_zlam_cols, s_B_rows)
+    if n_N == 0:
+        s = max(s_zy_cols, int(col_nnz.max()) if A.nnz > 0 else 0)
+    else:
+        s_zlam_cols = m + 1
+        s_B_rows = (int(col_nnz[B].max()) + n_N) if len(B) > 0 else 0
+        s = max(s_zy_cols, s_zlam_cols, s_B_rows)
 
     # M z = [-Aᵀ z_y + V z_λ]  (x = s = 1)
     def _matvec(z: np.ndarray) -> np.ndarray:
@@ -288,12 +402,19 @@ def _cycle_count_oss_from_basis(
         return out
 
     M_op = LinearOperator((n, n), matvec=_matvec, rmatvec=_rmatvec, dtype=np.float64)
-    sigma_max = float(svds(M_op, k=1, which="LM", return_singular_vectors=False)[0])
-    sigma_min = _sigma_min_timed(M_op, _OSS_SM_TIMEOUT)
+    sigma_max = _sigma_timed(M_op, "LM", _OSS_SM_TIMEOUT)
+    if sigma_max is None:
+        sigma_max = _sigma_max_random_probes(
+            M_op.matvec, n, _OSS_N_PROBES, _OSS_SM_TIMEOUT
+        )
+    sigma_min = _sigma_timed(M_op, "SM", _OSS_SM_TIMEOUT)
     if sigma_min is None:
-        sigma_min = _sigma_min_random_probes(M_op.matvec, n, _OSS_N_PROBES)
-    k = sigma_max / sigma_min
-    count = int(cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON) * (2 * n - 1) / _EPSILON**2)
+        sigma_min = _sigma_min_random_probes(
+            M_op.matvec, n, _OSS_N_PROBES, _OSS_SM_TIMEOUT
+        )
+    k = max(sigma_max / sigma_min, 1.0)
+    repetitions = math.ceil((2 * n - 1) / _EPSILON**2)
+    count = cycle_count_qlsa(s=s, k=k, epsilon=_EPSILON) * repetitions
     return count, s, k
 
 
@@ -304,22 +425,36 @@ def _cycle_count_oss(A: csr_matrix) -> tuple[int, int, float]:
     Uses svds on M_op with timeout + random probe fallback; result is a lower bound.
     Sparsity s = max(max row-nnz(A), m+1, max col-nnz(A_B) + n_N).
     """
-    A = csr_matrix(A, dtype=np.float64)
-    m, n = A.shape
-
-    if n <= 1:
-        return 0, 1, 1.0
-
-    return _cycle_count_oss_from_basis(*_preprocess_basis(A))
+    basis = _preprocess_basis(csr_matrix(A, dtype=np.float64))
+    if basis[1] < 2:
+        raise DegenerateInstanceError("Preprocessing reduced A below two rows")
+    return _cycle_count_oss_from_basis(*basis)
 
 
 def _load_standard_form(path: Path) -> csr_matrix:
     """Load A from .std standard-form LP (npz format). A returned as CSR."""
     data = np.load(path)
     A_data = np.asarray(data["A_data"], dtype=np.float64).ravel()
-    A_indices = np.asarray(data["A_indices"], dtype=np.int64).ravel()
-    A_indptr = np.asarray(data["A_indptr"], dtype=np.int64).ravel()
-    A_shape = np.asarray(data["A_shape"], dtype=np.int64).ravel()
+    raw_indices = np.asarray(data["A_indices"]).ravel()
+    raw_indptr = np.asarray(data["A_indptr"]).ravel()
+    raw_shape = np.asarray(data["A_shape"]).ravel()
+
+    def _integer_metadata(values: np.ndarray, name: str) -> np.ndarray:
+        try:
+            integer_valued = np.issubdtype(values.dtype, np.integer) or (
+                np.all(np.isfinite(values)) and np.all(values == np.floor(values))
+            )
+        except TypeError:
+            integer_valued = False
+        if not integer_valued:
+            raise ValueError(f".std {name} must be integer-valued")
+        return np.asarray(values, dtype=np.int64)
+
+    A_indices = _integer_metadata(raw_indices, "A_indices")
+    A_indptr = _integer_metadata(raw_indptr, "A_indptr")
+    A_shape = _integer_metadata(raw_shape, "A_shape")
+    if A_shape.size != 2:
+        raise ValueError("A_shape must contain two dimensions")
     m, n = int(A_shape[0]), int(A_shape[1])
     return csr_matrix((A_data, A_indices, A_indptr), shape=(m, n))
 
@@ -338,57 +473,91 @@ def _benchmark_instance_from_path(
         raise ValueError(f"variant must be 'mnes', 'oss', or 'both'; got {variant!r}")
 
     base_name = path.name[: -len(".std")]
-    A = _load_standard_form(path)
+    data_path = path.parent / (base_name + ".data")
+    try:
+        data = json.loads(data_path.read_text()) if data_path.exists() else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    active_variants = ["mnes", "oss"] if variant == "both" else [variant]
 
-    if A.shape[0] > 100_000:
+    def _skip(status: str) -> None:
+        for active in active_variants:
+            for key in _BENCHMARK_DATA_KEYS[active]:
+                data.pop(key, None)
+            data[f"status_{active}"] = status
+        _atomic_write_json(data_path, data)
+
+    try:
+        A = _load_standard_form(path)
+    except Exception as exc:  # noqa: BLE001 - persist corrupt-input status per instance
+        _skip(f"error:{type(exc).__name__}")
         return
 
-    data_path = path.parent / (base_name + ".data")
-    data = json.loads(data_path.read_text()) if data_path.exists() else {}
+    if A.shape[0] < 2 or A.shape[1] < 2:
+        _skip("skipped_degenerate")
+        return
+    if A.shape[0] > 100_000:
+        _skip("skipped_too_large")
+        return
+
+    def _failure_status(exc: BaseException) -> str:
+        if isinstance(exc, PreprocessTimeoutError):
+            return "timeout"
+        if isinstance(exc, PreprocessCrashedError):
+            return "crashed"
+        if isinstance(exc, RankUncertainError):
+            return "rank_uncertain"
+        if isinstance(exc, DegenerateInstanceError):
+            return "skipped_degenerate"
+        return f"error:{type(exc).__name__}"
+
+    def _record_failure(active: str, exc: BaseException) -> None:
+        failure_status = _failure_status(exc)
+        for key in _BENCHMARK_DATA_KEYS[active]:
+            if failure_status == "skipped_degenerate":
+                data.pop(key, None)
+            else:
+                data[key] = None
+        data[f"status_{active}"] = failure_status
+
+    def _record_success(active: str, result: tuple[int, int, float]) -> None:
+        count, sparsity, cond = result
+        cond = max(float(cond), 1.0)
+        if not math.isfinite(cond):
+            raise ArithmeticError("condition number is not finite")
+        data[f"cycle_count_{active}"] = count
+        data[f"sparsity_{active}"] = sparsity
+        data[f"cond_{active}"] = cond
+        data[f"status_{active}"] = "ok"
 
     if variant == "both":
-        m, n = A.shape
-        if n > 1:
-            try:
-                basis = _preprocess_basis(A)
-                count, sparsity, cond = _cycle_count_mnes_from_basis(*basis)
-                data["cycle_count_mnes"] = count
-                data["sparsity_mnes"] = sparsity
-                data["cond_mnes"] = None if not math.isfinite(cond) else cond
-                count, sparsity, cond = _cycle_count_oss_from_basis(*basis)
-                data["cycle_count_oss"] = count
-                data["sparsity_oss"] = sparsity
-                data["cond_oss"] = None if not math.isfinite(cond) else cond
-            except RuntimeError:
-                data["cycle_count_mnes"] = data["sparsity_mnes"] = data["cond_mnes"] = None
-                data["cycle_count_oss"] = data["sparsity_oss"] = data["cond_oss"] = None
+        try:
+            basis = _preprocess_basis(A)
+        except (RuntimeError, ValueError, ArithmeticError) as exc:
+            _record_failure("mnes", exc)
+            _record_failure("oss", exc)
         else:
-            count, sparsity, cond = _cycle_count_mnes(A)
-            data["cycle_count_mnes"] = count
-            data["sparsity_mnes"] = sparsity
-            data["cond_mnes"] = None if not math.isfinite(cond) else cond
-            count, sparsity, cond = _cycle_count_oss(A)
-            data["cycle_count_oss"] = count
-            data["sparsity_oss"] = sparsity
-            data["cond_oss"] = None if not math.isfinite(cond) else cond
-    elif variant == "mnes":
-        try:
-            count, sparsity, cond = _cycle_count_mnes(A)
-            data["cycle_count_mnes"] = count
-            data["sparsity_mnes"] = sparsity
-            data["cond_mnes"] = None if not math.isfinite(cond) else cond
-        except RuntimeError:
-            data["cycle_count_mnes"] = data["sparsity_mnes"] = data["cond_mnes"] = None
+            if basis[1] < 2:
+                _skip("skipped_degenerate")
+                return
+            try:
+                _record_success("mnes", _cycle_count_mnes_from_basis(*basis))
+            except (RuntimeError, ValueError, ArithmeticError) as exc:
+                _record_failure("mnes", exc)
+            try:
+                _record_success("oss", _cycle_count_oss_from_basis(*basis))
+            except (RuntimeError, ValueError, ArithmeticError) as exc:
+                _record_failure("oss", exc)
     else:
+        calculate = _cycle_count_mnes if variant == "mnes" else _cycle_count_oss
         try:
-            count, sparsity, cond = _cycle_count_oss(A)
-            data["cycle_count_oss"] = count
-            data["sparsity_oss"] = sparsity
-            data["cond_oss"] = None if not math.isfinite(cond) else cond
-        except RuntimeError:
-            data["cycle_count_oss"] = data["sparsity_oss"] = data["cond_oss"] = None
+            _record_success(variant, calculate(A))
+        except (RuntimeError, ValueError, ArithmeticError) as exc:
+            _record_failure(variant, exc)
 
-    data_path.write_text(json.dumps(data, indent=None))
+    _atomic_write_json(data_path, data)
 
 
 def benchmark_instance(
@@ -435,7 +604,13 @@ def benchmark_instance_class(
 
     subdirs = sorted(d for d in folder.iterdir() if d.is_dir())
     for subdir in tqdm(subdirs, desc=instance_class, unit="instance"):
-        benchmark_instance(instance_class, subdir.name, cache_dir=root, variant=variant)
+        if not any(subdir.glob("*.std")):
+            tqdm.write(f"skipping {subdir.name}: no .std file")
+            continue
+        try:
+            benchmark_instance(instance_class, subdir.name, cache_dir=root, variant=variant)
+        except Exception as exc:  # noqa: BLE001 - isolate corpus instances
+            tqdm.write(f"skipping {subdir.name}: {exc}")
 
 
 def benchmark_all_instance_classes(
@@ -476,7 +651,8 @@ def show_benchmark_status(
 
     For each instance class, prints one line per active variant showing
     "<class>  [mnes: x/total]  [oss: x/total]".
-    An instance counts as done when all _BENCHMARK_DATA_KEYS for the variant are present.
+    An instance counts as done when its status is ok. Legacy records count only
+    when their cycle-count value is finite.
     """
     root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
     if not root.is_dir():
@@ -499,9 +675,21 @@ def show_benchmark_status(
         counts: dict[str, int] = {v: 0 for v in active_variants}
         for subdir in subdirs:
             data_files = list(subdir.glob("*.data"))
-            data = json.loads(data_files[0].read_text()) if data_files else {}
+            try:
+                data = json.loads(data_files[0].read_text()) if data_files else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
             for v in active_variants:
-                if all(k in data for k in _BENCHMARK_DATA_KEYS[v]):
+                status_key = f"status_{v}"
+                value = data.get(f"cycle_count_{v}")
+                legacy_done = (
+                    status_key not in data
+                    and isinstance(value, (int, float))
+                    and math.isfinite(value)
+                )
+                if data.get(status_key) == "ok" or legacy_done:
                     counts[v] += 1
 
         parts = "  ".join(f"{v}: {counts[v]}/{total}" for v in active_variants)
@@ -513,25 +701,32 @@ def clear_benchmark_data(
     cache_dir: str | Path | None = None,
     variant: str = "both",
 ) -> None:
-    """Remove benchmark cycle-count entries from .data files."""
+    """Remove benchmark values and statuses from .data files."""
     root = Path(cache_dir).resolve() if cache_dir is not None else Path("cache_dir").resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Cache directory not found: {root}")
 
-    keys = (
+    value_keys = (
         _BENCHMARK_DATA_KEYS["mnes"] + _BENCHMARK_DATA_KEYS["oss"]
         if variant == "both"
         else _BENCHMARK_DATA_KEYS[variant]
     )
+    active_variants = ("mnes", "oss") if variant == "both" else (variant,)
+    keys = value_keys + tuple(f"status_{v}" for v in active_variants)
 
     search_roots = [root / name for name in instance_classes] if instance_classes else [root]
     for search_root in search_roots:
         for data_path in search_root.rglob("*.data"):
-            data = json.loads(data_path.read_text())
+            try:
+                data = json.loads(data_path.read_text())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
             if any(k in data for k in keys):
                 for k in keys:
                     data.pop(k, None)
-                data_path.write_text(json.dumps(data, indent=None))
+                _atomic_write_json(data_path, data)
 
 
 if __name__ == "__main__":

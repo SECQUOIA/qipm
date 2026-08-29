@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Visualise npz fixture files (.std, .sde, .init) in human-readable form on the console.
+"""Visualise .std NPZ fixture files in human-readable form on the console.
 
 Usage:
     python tests/visualise_npz.py tests/fixtures/min_sum.std
-    python tests/visualise_npz.py tests/fixtures/equality.sde
-    python tests/visualise_npz.py tests/fixtures/equality.init
 """
 
 import argparse
@@ -29,10 +27,8 @@ def _format_array(arr: np.ndarray, max_entries: int = 50) -> str:
 
 
 def _print_standard_form(data: np.lib.npyio.NpzFile, path: Path) -> None:
-    """Print standard-form LP (A, b, c) from .std / .sde npz."""
-    suffix = path.suffix.lower()
-    label = "Self-dual embedding (SDE)" if suffix == ".sde" else "Standard form (std)"
-    print(f"# {path.name} — {label}")
+    """Print standard-form LP (A, b, c) from .std NPZ."""
+    print(f"# {path.name} — Standard form (std)")
     print()
 
     c = np.asarray(data["c"], dtype=np.float64).ravel()
@@ -57,32 +53,6 @@ def _print_standard_form(data: np.lib.npyio.NpzFile, path: Path) -> None:
     np.set_printoptions(precision=6, suppress=True, linewidth=120)
     print(A.toarray())
     np.set_printoptions()  # reset
-
-
-def _print_init(data: np.lib.npyio.NpzFile, path: Path) -> None:
-    """Print initial triple (x, y, s) and embedding_used from .init npz."""
-    print(f"# {path.name} — Initial triple (.init)")
-    print()
-
-    x = np.asarray(data["x"], dtype=np.float64).ravel()
-    y = np.asarray(data["y"], dtype=np.float64).ravel()
-    s = np.asarray(data["s"], dtype=np.float64).ravel()
-    embedding_used = np.asarray(data["embedding_used"], dtype=bool)
-    if embedding_used.size == 1:
-        embedding_used = bool(embedding_used.flat[0])
-    else:
-        embedding_used = embedding_used.tolist()
-
-    print("embedding_used:", embedding_used)
-    print()
-    print("x (primal, length n):")
-    print(_format_array(x))
-    print()
-    print("y (dual, length m):")
-    print(_format_array(y))
-    print()
-    print("s (slack, length n):")
-    print(_format_array(s))
 
 
 def _print_generic_npz(data: np.lib.npyio.NpzFile, path: Path) -> None:
@@ -111,28 +81,23 @@ def visualise(path: Path) -> None:
     data = np.load(path, allow_pickle=False)
     suffix = path.suffix.lower()
 
-    if suffix in (".std", ".sde"):
+    if suffix == ".std":
         if not all(k in data.files for k in ("c", "b", "A_data", "A_indices", "A_indptr", "A_shape")):
             _print_generic_npz(data, path)
         else:
             _print_standard_form(data, path)
-    elif suffix == ".init":
-        if not all(k in data.files for k in ("x", "y", "s", "embedding_used")):
-            _print_generic_npz(data, path)
-        else:
-            _print_init(data, path)
     else:
         _print_generic_npz(data, path)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Print npz fixture files (.std, .sde, .init) in human-readable form."
+        description="Print .std NPZ fixture files in human-readable form."
     )
     parser.add_argument(
         "file",
         type=Path,
-        help="Path to .npz-style file (e.g. tests/fixtures/min_sum.std or .sde or .init)",
+        help="Path to a .std NPZ file (e.g. tests/fixtures/min_sum.std)",
     )
     args = parser.parse_args()
     try:
