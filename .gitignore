@@ -45,3 +45,6 @@ cache_dir/
 
 # Local reference repositories
 reference_repositories/
+
+# Local literature
+literature/
