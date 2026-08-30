@@ -27,6 +27,7 @@ def test_advantage_loading_keeps_zero_runtime_and_filters_bad_counts(tmp_path) -
     (instance_dir / "item.data").write_text(
         json.dumps(
             {
+                "benchmark_model": 2,
                 "runtime_glpk": 0.0,
                 "cycle_count_mnes": 10,
                 "cycle_count_oss": float("inf"),
@@ -37,6 +38,26 @@ def test_advantage_loading_keeps_zero_runtime_and_filters_bad_counts(tmp_path) -
     assert len(loaded["cls"]) == 1
     np.testing.assert_array_equal(_cycle_counts(loaded["cls"], "mnes"), [10.0])
     assert _cycle_counts(loaded["cls"], "oss") is None
+
+
+def test_plot_loader_skips_and_reports_outdated_model(tmp_path, capsys) -> None:
+    for name, model in (("current", 2), ("old", 1)):
+        instance_dir = tmp_path / "cls" / name
+        instance_dir.mkdir(parents=True)
+        (instance_dir / f"{name}.data").write_text(json.dumps({
+            "benchmark_model": model,
+            "runtime_glpk": 1.0,
+            "cycle_count_mnes": 10,
+        }))
+    never_benchmarked = tmp_path / "cls" / "solve_only"
+    never_benchmarked.mkdir(parents=True)
+    (never_benchmarked / "solve_only.data").write_text(json.dumps({
+        "solve_status_std": "ok",
+        "runtime_highs_std": 1.0,
+    }))
+    loaded = _load_advantage_data(["cls"], tmp_path, "runtime_glpk")
+    assert len(loaded["cls"]) == 1
+    assert "Skipped 1 outdated benchmark-model records." in capsys.readouterr().out
 
 
 def test_difficulty_bins_and_zero_truncation_remain_visible() -> None:
@@ -52,6 +73,7 @@ def test_difficulty_loading_excludes_unrepresentable_sparsity(tmp_path) -> None:
     instance_dir = tmp_path / "cls" / "huge"
     instance_dir.mkdir(parents=True)
     (instance_dir / "huge.data").write_text(json.dumps({
+        "benchmark_model": 2,
         "sparsity_mnes": 10**1000,
         "cond_mnes": 1.0,
     }))
@@ -83,6 +105,7 @@ def test_ratio_loading_filters_and_computes_both_ratios(tmp_path) -> None:
         "unbenchmarked_missing_runtime": {},
     }
     for name, record in records.items():
+        record["benchmark_model"] = 2
         instance_dir = tmp_path / "cls" / name
         instance_dir.mkdir(parents=True)
         (instance_dir / f"{name}.data").write_text(json.dumps(record))
@@ -96,7 +119,7 @@ def test_ratio_loading_filters_and_computes_both_ratios(tmp_path) -> None:
     assert skipped == {
         "missing_runtime": 1,
         "invalid_runtime": 1,
-        "needs_refresh": 1,
+        "invalid_breakdown": 1,
         "unplottable_overflow": 0,
     }
     assert eligible == 1
@@ -126,6 +149,7 @@ def test_ratio_loading_checks_large_integer_invariant_exactly(tmp_path) -> None:
         },
     }
     for name, record in records.items():
+        record["benchmark_model"] = 2
         instance_dir = tmp_path / "cls" / name
         instance_dir.mkdir(parents=True)
         (instance_dir / f"{name}.data").write_text(json.dumps(record))
@@ -136,7 +160,7 @@ def test_ratio_loading_checks_large_integer_invariant_exactly(tmp_path) -> None:
 
     total, prep = data["cls"]["mnes"]
     assert len(total) == len(prep) == 1
-    assert skipped["needs_refresh"] == 1
+    assert skipped["invalid_breakdown"] == 1
     assert eligible == 1
 
 
@@ -145,6 +169,7 @@ def test_huge_count_flows_through_advantage_and_ratio_loaders(tmp_path) -> None:
     instance_dir = tmp_path / "cls" / "huge"
     instance_dir.mkdir(parents=True)
     (instance_dir / "huge.data").write_text(json.dumps({
+        "benchmark_model": 2,
         "runtime_highs_std": 2.0,
         "cycle_count_mnes": huge_count,
         "qlsa_queries_mnes": huge_count,
@@ -170,6 +195,7 @@ def test_ratio_loader_recovers_finite_ratio_after_float_overflow(tmp_path) -> No
     instance_dir = tmp_path / "cls" / "recoverable"
     instance_dir.mkdir(parents=True)
     (instance_dir / "recoverable.data").write_text(json.dumps({
+        "benchmark_model": 2,
         "runtime_highs_std": 1.0,
         "cycle_count_mnes": count,
         "qlsa_queries_mnes": count,
@@ -192,6 +218,7 @@ def test_ratio_loader_counts_exact_retry_overflow(tmp_path) -> None:
     instance_dir = tmp_path / "cls" / "unplottable"
     instance_dir.mkdir(parents=True)
     (instance_dir / "unplottable.data").write_text(json.dumps({
+        "benchmark_model": 2,
         "runtime_highs_std": 1e-8,
         "cycle_count_mnes": count,
         "qlsa_queries_mnes": count,
@@ -211,6 +238,7 @@ def test_ratio_loader_counts_nonfinite_float_result(tmp_path) -> None:
     instance_dir = tmp_path / "cls" / "nonfinite"
     instance_dir.mkdir(parents=True)
     (instance_dir / "nonfinite.data").write_text(json.dumps({
+        "benchmark_model": 2,
         "runtime_highs_std": 1e-8,
         "cycle_count_mnes": 10,
         "qlsa_queries_mnes": 10,
@@ -238,6 +266,7 @@ def test_ratio_plot_styles_smoke(style, tmp_path, monkeypatch, capsys) -> None:
     instance_dir = tmp_path / "cls" / "item"
     instance_dir.mkdir(parents=True)
     (instance_dir / "item.data").write_text(json.dumps({
+        "benchmark_model": 2,
         "runtime_highs_std": 2.0,
         "cycle_count_mnes": 100,
         "qlsa_queries_mnes": 10,
@@ -259,6 +288,6 @@ def test_ratio_plot_styles_smoke(style, tmp_path, monkeypatch, capsys) -> None:
 
     assert output.is_file()
     output_text = capsys.readouterr().out
-    assert "benchmark.py --refresh-counts" in output_text
+    assert "invalid query/repetition breakdown" in output_text
     assert "overflow plotting" in output_text
     assert f"Saved to {output}" in output_text

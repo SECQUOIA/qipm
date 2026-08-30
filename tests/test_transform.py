@@ -25,7 +25,9 @@ from transform import (
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 SURVIVING_STEMS = ["surviving_mixed", "surviving_range"]
 DOWNSTREAM_DATA = {
+    "benchmark_model": 2,
     "cycle_count_mnes": 10,
+    "cycle_count_floor_mnes": 2,
     "sparsity_mnes": 2,
     "cond_mnes": 3.0,
     "cond_method_mnes": "svds",

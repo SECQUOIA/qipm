@@ -15,14 +15,21 @@ import numpy as np
 from tqdm import tqdm
 
 VARIANTS = ("mnes", "oss")
+BENCHMARK_MODEL = 2
+BENCHMARK_MODEL_KEY = "benchmark_model"
 
 
 class BenchmarkValueKeys(NamedTuple):
     count: str
+    count_best_known: str
+    count_floor: str
     sparsity: str
+    sparsity_method: str
     cond: str
     cond_method: str
     qlsa_queries: str
+    qlsa_queries_best_known: str
+    qlsa_queries_floor: str
     tomography_reps: str
 
 
@@ -34,10 +41,15 @@ SOLVE_RESULT_KEYS = {
 BENCHMARK_VALUE_KEYS = {
     variant: BenchmarkValueKeys(
         f"cycle_count_{variant}",
+        f"cycle_count_best_known_{variant}",
+        f"cycle_count_floor_{variant}",
         f"sparsity_{variant}",
+        f"sparsity_method_{variant}",
         f"cond_{variant}",
         f"cond_method_{variant}",
         f"qlsa_queries_{variant}",
+        f"qlsa_queries_best_known_{variant}",
+        f"qlsa_queries_floor_{variant}",
         f"tomography_reps_{variant}",
     )
     for variant in VARIANTS
@@ -50,8 +62,10 @@ BENCHMARK_RESULT_KEYS = {
 
 # Results whose meaning depends on the current .std. MPS solve results are
 # intentionally excluded because they remain valid when standard form changes.
-STD_DERIVED_KEYS = SOLVE_RESULT_KEYS["std"] + tuple(
-    key for variant in VARIANTS for key in BENCHMARK_RESULT_KEYS[variant]
+STD_DERIVED_KEYS = (
+    SOLVE_RESULT_KEYS["std"]
+    + tuple(key for variant in VARIANTS for key in BENCHMARK_RESULT_KEYS[variant])
+    + (BENCHMARK_MODEL_KEY,)
 )
 
 LedgerState = Literal["missing", "invalid", "valid"]
@@ -190,6 +204,7 @@ def summarize_records(
     value_key: str,
     status_key: str,
     ok_statuses: Iterable[str],
+    required_model: int | None = None,
 ) -> tuple[int, Counter[str]]:
     """Summarize successful statuses and label all other records."""
     ok_statuses = tuple(ok_statuses)
@@ -207,8 +222,16 @@ def summarize_records(
             and stored_finite_number(value)
         )
         status = data.get(status_key)
-        if (isinstance(status, str) and status in ok_statuses) or legacy_done:
-            count += 1
+        if isinstance(status, str) and status in ok_statuses:
+            if required_model is not None and data.get(BENCHMARK_MODEL_KEY) != required_model:
+                non_ok["outdated_model"] += 1
+            else:
+                count += 1
+        elif legacy_done:
+            if required_model is not None:
+                non_ok["outdated_model"] += 1
+            else:
+                count += 1
         elif status_key not in data:
             non_ok["absent"] += 1
         elif isinstance(status, str):

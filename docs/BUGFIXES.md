@@ -2,6 +2,8 @@
 
 Line references below describe the pre-fix files. “Empirical” means the defect was reproduced against the installed environment or a constructed fixture; “reading” means it follows directly from the implementation and the fixed paper specification.
 
+These entries describe benchmark model 1 and are superseded where they conflict with [LOWER_BOUND_REVISION.md](LOWER_BOUND_REVISION.md).
+
 ## Critical result-integrity defects
 
 - **F1 — Presolve output was discarded (`transform.py:227-245`).** Confirmed empirically and by reading: `getLp()` returned the original model after `presolve()`. This changed benchmark inputs and results. The transform now uses `getPresolvedLp()`, distinguishes definite and ambiguous unbounded outcomes, whitelists only reduced/not-reduced success statuses, records all outcomes, and rejects maximization or non-continuous models. Decompressed arrays are compared before replacement: unchanged output preserves downstream results, while changed output atomically purges results derived from the old `.std` before replacement; failed or withheld reruns also remove the stale file. JSON syntax, byte-level UTF-8 corruption, and non-object `.data` are replaced safely. Success-status publication is outside conversion error retraction, conversion exceptions record `error:<ExceptionName>` and are re-raised, and an empty MPS now records `error:RuntimeError` and retracts `.std` instead of warning and returning.

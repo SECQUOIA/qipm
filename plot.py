@@ -13,6 +13,9 @@ import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 
 from store import (
+    BENCHMARK_MODEL,
+    BENCHMARK_MODEL_KEY,
+    BENCHMARK_STATUS_KEYS,
     BENCHMARK_VALUE_KEYS,
     SOLVE_RESULT_KEYS,
     VARIANTS,
@@ -95,8 +98,9 @@ def _difficulty_bins(values: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _iter_records(instance_classes: list[str], cache_dir: Path) -> dict[str, list[dict]]:
-    """Load all .data JSON files, grouped by class."""
+    """Load current model-2 .data records, grouped by class."""
     result: dict[str, list[dict]] = {}
+    outdated = 0
     for cls in instance_classes:
         cls_dir = cache_dir / cls
         if not cls_dir.is_dir():
@@ -111,9 +115,17 @@ def _iter_records(instance_classes: list[str], cache_dir: Path) -> dict[str, lis
             except OSError:
                 continue
             if state == "valid":
-                records.append(record)
+                if record.get(BENCHMARK_MODEL_KEY) == BENCHMARK_MODEL:
+                    records.append(record)
+                elif (
+                    BENCHMARK_MODEL_KEY in record
+                    or any(key in record for key in BENCHMARK_STATUS_KEYS.values())
+                ):
+                    outdated += 1
         if records:
             result[cls] = records
+    if outdated:
+        print(f"Skipped {outdated} outdated benchmark-model records.")
     return result
 
 
@@ -279,7 +291,7 @@ def plot_advantage(
     ax.axvline(DEFAULT_CYCLE_DURATION, color="#444444", linestyle=":", linewidth=1.2)
     ax.text(
         DEFAULT_CYCLE_DURATION * 0.82, 50,
-        "current speed record for\n an entangling gate operation",
+        "illustrative optimistic proxy\nfrom an entangling gate operation",
         ha="right", va="center", fontsize=8.5, rotation=90, color="#444444",
     )
 
@@ -464,7 +476,7 @@ def _load_ratio_data(
     skipped = {
         "missing_runtime": 0,
         "invalid_runtime": 0,
-        "needs_refresh": 0,
+        "invalid_breakdown": 0,
         "unplottable_overflow": 0,
     }
     eligible_instances = 0
@@ -506,7 +518,7 @@ def _load_ratio_data(
                     or repetitions <= 0
                     or count != queries * repetitions
                 ):
-                    skipped["needs_refresh"] += 1
+                    skipped["invalid_breakdown"] += 1
                     continue
                 try:
                     total_ratio = cycle_time * count / runtime
@@ -586,8 +598,8 @@ def plot_ratio(
     print(
         f"Ratio data: {skipped['missing_runtime']} records missing the runtime key; "
         f"{skipped['invalid_runtime']} records with non-positive or non-finite runtime; "
-        f"{skipped['needs_refresh']} variant records need "
-        "benchmark.py --refresh-counts; "
+        f"{skipped['invalid_breakdown']} variant records have an invalid "
+        "query/repetition breakdown; "
         f"{skipped['unplottable_overflow']} variant records overflow plotting."
     )
     if not data:
@@ -671,13 +683,16 @@ def plot_ratio(
         else r"\% of instances with ratio $\leq x$"
     )
     series_handles = [
-        mpatches.Patch(facecolor="#777777", label=r"total ($Q\times R$)"),
+        mpatches.Patch(facecolor="#777777", label=r"modeled serial work ($Q\times R$)"),
         mpatches.Patch(
             facecolor="#BBBBBB", hatch="///", alpha=0.4,
             label="one QLSA state preparation (no readout)",
         ),
     ] if style == "box" else [
-        mlines.Line2D([], [], color="#333333", linestyle="-", label=r"total ($Q\times R$)"),
+        mlines.Line2D(
+            [], [], color="#333333", linestyle="-",
+            label=r"modeled serial work ($Q\times R$)",
+        ),
         mlines.Line2D(
             [], [], color="#333333", linestyle="--",
             label="one QLSA state preparation (no readout)",
@@ -690,7 +705,8 @@ def plot_ratio(
     )
     fig.text(
         0.5, 0.01,
-        f"Cycle duration: {_cycle_duration_label(cycle_time)}; classical baseline: "
+        f"Illustrative optimistic cycle proxy: {_cycle_duration_label(cycle_time)}; "
+        "serial query work, not wall-clock time; classical baseline: "
         f"{baseline_label}; eligible instances: {eligible}",
         ha="center", fontsize=9,
     )
@@ -735,13 +751,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ratio",
         action="store_true",
-        help="Plot fixed-cycle quantum/classical runtime ratios instead of advantage curves.",
+        help=(
+            "Plot Q×R serial-query-work ratios, not hardware-independent wall-clock "
+            "lower bounds."
+        ),
     )
     parser.add_argument(
         "--cycle-time",
         type=float,
         default=DEFAULT_CYCLE_DURATION,
-        help="Assumed quantum cycle duration in seconds for --ratio (default: 8e-10).",
+        help=(
+            "Illustrative optimistic logical-cycle proxy in seconds for --ratio "
+            "(default: 8e-10)."
+        ),
     )
     parser.add_argument(
         "--ratio-style",
