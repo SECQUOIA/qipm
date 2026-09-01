@@ -30,6 +30,14 @@ from store import (
 DEFAULT_CYCLE_DURATION = 8e-10
 N_POINTS = 500
 N_BINS = 30
+# Beyond this scale, double precision cannot support meaningful condition estimates.
+CONDITION_NUMBER_LIMIT = 1e16
+
+ESTIMATE_LABELS = {
+    "modeled": "Modeled",
+    "best-known": "Best-known",
+    "floor": "Scaling-only floor",
+}
 
 CLASS_LABELS = {
     "independent_set": "Independent Set",
@@ -81,6 +89,26 @@ def _as_float(value: object) -> float:
         return float(value)
     except OverflowError:
         return math.inf
+
+
+def _estimate_keys(variant: str, estimate: str) -> tuple[str, str]:
+    keys = BENCHMARK_VALUE_KEYS[variant]
+    if estimate == "modeled":
+        return keys.count, keys.qlsa_queries
+    if estimate == "best-known":
+        return keys.count_best_known, keys.qlsa_queries_best_known
+    if estimate == "floor":
+        return keys.count_floor, keys.qlsa_queries_floor
+    raise ValueError(f"Unknown estimate: {estimate!r}")
+
+
+def _condition_excluded(record: dict, variant: str) -> bool:
+    value = record.get(BENCHMARK_VALUE_KEYS[variant].cond)
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > CONDITION_NUMBER_LIMIT
+    )
 
 
 def _difficulty_bins(values: np.ndarray) -> np.ndarray:
@@ -137,31 +165,42 @@ def _load_advantage_data(
     instance_classes: list[str],
     cache_dir: Path,
     runtime_key: str,
+    estimate: str = "modeled",
+    min_runtime: float = 0.0,
+    variants: list[str] | None = None,
 ) -> dict[str, list[dict]]:
-    """Filter records to those with a valid runtime and at least one cycle count."""
+    """Filter by count, condition number, and runtime, printing exclusion counts."""
     all_records = _iter_records(instance_classes, cache_dir)
+    variants = list(VARIANTS) if variants is None else variants
     result = {}
+    condition_exclusions = 0
+    runtime_exclusions = 0
     for cls, records in all_records.items():
-        filtered = [
-            r for r in records
-            if _finite_number(r.get(runtime_key))
-            and (
-                _finite_number(r.get(BENCHMARK_VALUE_KEYS["mnes"].count), positive=True)
-                or _finite_number(r.get(BENCHMARK_VALUE_KEYS["oss"].count), positive=True)
-            )
-        ]
+        filtered = []
+        for record in records:
+            eligible_variants = []
+            for variant in variants:
+                count_key, _ = _estimate_keys(variant, estimate)
+                if not _finite_number(record.get(count_key), positive=True):
+                    continue
+                if _condition_excluded(record, variant):
+                    condition_exclusions += 1
+                    continue
+                eligible_variants.append(variant)
+            if not eligible_variants or not _finite_number(record.get(runtime_key)):
+                continue
+            if record[runtime_key] < min_runtime:
+                runtime_exclusions += 1
+                continue
+            filtered.append(record)
         if filtered:
             result[cls] = filtered
+    print(
+        f"Advantage data: {condition_exclusions} variant records excluded for "
+        f"condition number > {CONDITION_NUMBER_LIMIT:g}; {runtime_exclusions} "
+        f"records below the {min_runtime:g} s runtime floor."
+    )
     return result
-
-
-def _cycle_counts(records: list[dict], variant: str) -> np.ndarray | None:
-    """Extract cycle counts for a single variant ('mnes' or 'oss')."""
-    key = BENCHMARK_VALUE_KEYS[variant].count
-    vals = [r[key] for r in records if _finite_number(r.get(key), positive=True)]
-    if not vals:
-        return None
-    return np.array([_as_float(value) for value in vals], dtype=np.float64)
 
 
 def _crossover_times(cycle_counts: np.ndarray, runtimes: np.ndarray) -> np.ndarray:
@@ -169,18 +208,22 @@ def _crossover_times(cycle_counts: np.ndarray, runtimes: np.ndarray) -> np.ndarr
 
 
 def _advantage_pairs(
-    data: dict[str, list[dict]], variants: list[str], runtime_key: str
+    data: dict[str, list[dict]],
+    variants: list[str],
+    runtime_key: str,
+    estimate: str = "modeled",
 ) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]:
     """Build aligned cycle-count/runtime arrays once for every class and variant."""
     result: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
     for cls, records in data.items():
         class_pairs = {}
         for variant in variants:
-            key = BENCHMARK_VALUE_KEYS[variant].count
+            key, _ = _estimate_keys(variant, estimate)
             pairs = [
                 (record[key], record[runtime_key])
                 for record in records
                 if _finite_number(record.get(key), positive=True)
+                and not _condition_excluded(record, variant)
             ]
             if pairs:
                 class_pairs[variant] = (
@@ -216,28 +259,38 @@ def plot_advantage(
     cache_dir: Path,
     output: Path,
     runtime_key: str = SOLVE_RESULT_KEYS["std"][0],
+    estimate: str = "modeled",
+    min_runtime: float = 0.0,
 ) -> None:
     """Plot advantage curves. variant: 'mnes', 'oss', or 'both'."""
-    data = _load_advantage_data(instance_classes, cache_dir, runtime_key)
+    variants = list(VARIANTS) if variant == "both" else [variant]
+    data = _load_advantage_data(
+        instance_classes, cache_dir, runtime_key, estimate, min_runtime, variants
+    )
     if not data:
         print("No data found.")
         return
 
-    variants = list(VARIANTS) if variant == "both" else [variant]
     if variant == "both":
         complete = {}
         for cls, records in data.items():
             selected = [
                 record
                 for record in records
-                if _finite_number(record.get(BENCHMARK_VALUE_KEYS["mnes"].count), positive=True)
-                and _finite_number(record.get(BENCHMARK_VALUE_KEYS["oss"].count), positive=True)
+                if _finite_number(
+                    record.get(_estimate_keys("mnes", estimate)[0]), positive=True
+                )
+                and not _condition_excluded(record, "mnes")
+                and _finite_number(
+                    record.get(_estimate_keys("oss", estimate)[0]), positive=True
+                )
+                and not _condition_excluded(record, "oss")
             ]
             if selected:
                 complete[cls] = selected
         data = complete
 
-    pair_data = _advantage_pairs(data, variants, runtime_key)
+    pair_data = _advantage_pairs(data, variants, runtime_key, estimate)
     all_cts = [
         _crossover_times(counts, runtimes)
         for class_pairs in pair_data.values()
@@ -299,6 +352,7 @@ def plot_advantage(
     ax.set_xlim(x_min, x_max)
     ax.set_xlabel("quantum cycle duration ($s$)", fontsize=11, labelpad=8)
     ax.set_ylabel(r"instances with quantum advantage (\%)", fontsize=11, labelpad=8)
+    ax.set_title(f"{ESTIMATE_LABELS[estimate]} query-cost estimate", fontsize=11)
     ax.set_ylim(0, 102)
     ax.set_yticks([0, 25, 50, 75, 100])
     ax.tick_params(axis="both", labelsize=9.5)
@@ -345,11 +399,13 @@ def _load_difficulty_data(
     instance_classes: list[str],
     cache_dir: Path,
     variant: str,
+    report_exclusions: bool = True,
 ) -> dict[str, np.ndarray]:
     """Load s·κ products for each class for the given variant ('mnes' or 'oss')."""
     keys = BENCHMARK_VALUE_KEYS[variant]
     all_records = _iter_records(instance_classes, cache_dir)
     result: dict[str, np.ndarray] = {}
+    condition_exclusions = 0
     for cls, records in all_records.items():
         values = []
         for r in records:
@@ -357,11 +413,19 @@ def _load_difficulty_data(
             k = r.get(keys.cond)
             if not _finite_number(s, positive=True) or not _finite_number(k, positive=True):
                 continue
+            if _condition_excluded(r, variant):
+                condition_exclusions += 1
+                continue
             product = _as_float(s) * _as_float(k)
             if math.isfinite(product) and product > 0:
                 values.append(product)
         if values:
             result[cls] = np.array(values, dtype=np.float64)
+    if report_exclusions:
+        print(
+            f"Difficulty data ({variant}): {condition_exclusions} records excluded for "
+            f"condition number > {CONDITION_NUMBER_LIMIT:g}."
+        )
     return result
 
 
@@ -463,6 +527,8 @@ def _load_ratio_data(
     runtime_key: str,
     cycle_time: float,
     variants: list[str] | None = None,
+    estimate: str = "modeled",
+    min_runtime: float = 0.0,
 ) -> tuple[
     dict[str, dict[str, tuple[np.ndarray, np.ndarray]]],
     dict[str, int],
@@ -478,6 +544,8 @@ def _load_ratio_data(
         "invalid_runtime": 0,
         "invalid_breakdown": 0,
         "unplottable_overflow": 0,
+        "condition_number": 0,
+        "min_runtime": 0,
     }
     eligible_instances = 0
 
@@ -486,13 +554,15 @@ def _load_ratio_data(
             variant: ([], []) for variant in variants
         }
         for record in records:
-            eligible_variants = [
-                variant
-                for variant in variants
-                if _positive_stored_number(
-                    record.get(BENCHMARK_VALUE_KEYS[variant].count)
-                )
-            ]
+            eligible_variants = []
+            for variant in variants:
+                count_key, _ = _estimate_keys(variant, estimate)
+                if not _positive_stored_number(record.get(count_key)):
+                    continue
+                if _condition_excluded(record, variant):
+                    skipped["condition_number"] += 1
+                    continue
+                eligible_variants.append(variant)
             if not eligible_variants:
                 continue
             if runtime_key not in record:
@@ -502,12 +572,16 @@ def _load_ratio_data(
             if not _positive_stored_number(runtime):
                 skipped["invalid_runtime"] += 1
                 continue
+            if runtime < min_runtime:
+                skipped["min_runtime"] += 1
+                continue
             record_eligible = False
             for variant in eligible_variants:
                 keys = BENCHMARK_VALUE_KEYS[variant]
-                raw_count = record.get(keys.count)
+                count_key, query_key = _estimate_keys(variant, estimate)
+                raw_count = record.get(count_key)
                 count = _stored_integer(raw_count)
-                queries = _stored_integer(record.get(keys.qlsa_queries))
+                queries = _stored_integer(record.get(query_key))
                 repetitions = _stored_integer(record.get(keys.tomography_reps))
                 if (
                     count is None
@@ -587,13 +661,16 @@ def plot_ratio(
     cycle_time: float = DEFAULT_CYCLE_DURATION,
     style: str = "box",
     variant: str = "both",
+    estimate: str = "modeled",
+    min_runtime: float = 0.0,
 ) -> None:
     """Plot fixed-cycle quantum/classical runtime ratios."""
     if style not in ("box", "ecdf"):
         raise ValueError("ratio style must be 'box' or 'ecdf'")
     variants = list(VARIANTS) if variant == "both" else [variant]
     data, skipped, eligible = _load_ratio_data(
-        instance_classes, cache_dir, runtime_key, cycle_time, variants
+        instance_classes, cache_dir, runtime_key, cycle_time, variants,
+        estimate, min_runtime,
     )
     print(
         f"Ratio data: {skipped['missing_runtime']} records missing the runtime key; "
@@ -601,6 +678,9 @@ def plot_ratio(
         f"{skipped['invalid_breakdown']} variant records have an invalid "
         "query/repetition breakdown; "
         f"{skipped['unplottable_overflow']} variant records overflow plotting."
+        f" {skipped['condition_number']} variant records excluded for condition "
+        f"number > {CONDITION_NUMBER_LIMIT:g}; {skipped['min_runtime']} records "
+        f"below the {min_runtime:g} s runtime floor."
     )
     if not data:
         print("No ratio data found.")
@@ -683,7 +763,10 @@ def plot_ratio(
         else r"\% of instances with ratio $\leq x$"
     )
     series_handles = [
-        mpatches.Patch(facecolor="#777777", label=r"modeled serial work ($Q\times R$)"),
+        mpatches.Patch(
+            facecolor="#777777",
+            label=rf"{ESTIMATE_LABELS[estimate]} serial work ($Q\times R$)",
+        ),
         mpatches.Patch(
             facecolor="#BBBBBB", hatch="///", alpha=0.4,
             label="one QLSA state preparation (no readout)",
@@ -691,14 +774,18 @@ def plot_ratio(
     ] if style == "box" else [
         mlines.Line2D(
             [], [], color="#333333", linestyle="-",
-            label=r"modeled serial work ($Q\times R$)",
+            label=rf"{ESTIMATE_LABELS[estimate]} serial work ($Q\times R$)",
         ),
         mlines.Line2D(
             [], [], color="#333333", linestyle="--",
             label="one QLSA state preparation (no readout)",
         ),
     ]
-    fig.suptitle("Fixed-cycle quantum/classical runtime ratio", y=0.98)
+    fig.suptitle(
+        f"Fixed-cycle quantum/classical runtime ratio — "
+        f"{ESTIMATE_LABELS[estimate]} estimate",
+        y=0.98,
+    )
     fig.legend(
         handles=series_handles, loc="upper center", bbox_to_anchor=(0.5, 0.92),
         ncol=2, frameon=False,
@@ -744,6 +831,21 @@ if __name__ == "__main__":
         help="Classical solver runtime to compare against (default: highs-std). Ignored with --difficulty.",
     )
     parser.add_argument(
+        "--estimate",
+        choices=list(ESTIMATE_LABELS),
+        default="modeled",
+        help="Query-cost estimate to plot (default: modeled). Ignored with --difficulty.",
+    )
+    parser.add_argument(
+        "--min-runtime",
+        type=float,
+        default=0.0,
+        help=(
+            "Exclude advantage and ratio records below this classical runtime "
+            "in seconds (default: 0; about 1e-2 is recommended to remove timer overhead)."
+        ),
+    )
+    parser.add_argument(
         "--difficulty",
         action="store_true",
         help="Plot s·κ difficulty histogram instead of advantage curves.",
@@ -785,6 +887,8 @@ if __name__ == "__main__":
             args.cycle_time = _validate_cycle_time(args.cycle_time)
         except ValueError as exc:
             parser.error(str(exc))
+    if not math.isfinite(args.min_runtime) or args.min_runtime < 0:
+        parser.error("minimum runtime must be non-negative and finite")
 
     cache_dir = resolve_cache_root(args.cache_dir)
 
@@ -794,13 +898,16 @@ if __name__ == "__main__":
     else:
         classes = list_class_names(cache_dir) if cache_dir.is_dir() else []
         classes_tag = "all"
+    estimate_suffix = "" if args.estimate == "modeled" else f"_{args.estimate}"
 
     if args.difficulty:
         variants = list(VARIANTS) if args.variant == "both" else [args.variant]
         if len(variants) > 1:
             peak_counts = []
             for v in variants:
-                vdata = _load_difficulty_data(classes, cache_dir, v)
+                vdata = _load_difficulty_data(
+                    classes, cache_dir, v, report_exclusions=False
+                )
                 if not vdata:
                     continue
                 _, _, _, stacked = _build_difficulty_histogram(vdata)
@@ -821,19 +928,27 @@ if __name__ == "__main__":
             instance_classes=classes,
             cache_dir=cache_dir,
             output=Path(
-                f"plot_ratio_{classes_tag}_{args.solver}_{args.variant}_{args.ratio_style}.pdf"
+                f"plot_ratio_{classes_tag}_{args.solver}_{args.variant}_"
+                f"{args.ratio_style}{estimate_suffix}.pdf"
             ),
             runtime_key=RUNTIME_KEYS[args.solver],
             baseline_label=args.solver,
             cycle_time=args.cycle_time,
             style=args.ratio_style,
             variant=args.variant,
+            estimate=args.estimate,
+            min_runtime=args.min_runtime,
         )
     else:
         plot_advantage(
             instance_classes=classes,
             variant=args.variant,
             cache_dir=cache_dir,
-            output=Path(f"plot_advantage_{classes_tag}_{args.solver}_{args.variant}.pdf"),
+            output=Path(
+                f"plot_advantage_{classes_tag}_{args.solver}_{args.variant}"
+                f"{estimate_suffix}.pdf"
+            ),
             runtime_key=RUNTIME_KEYS[args.solver],
+            estimate=args.estimate,
+            min_runtime=args.min_runtime,
         )

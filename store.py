@@ -17,6 +17,7 @@ from tqdm import tqdm
 VARIANTS = ("mnes", "oss")
 BENCHMARK_MODEL = 2
 BENCHMARK_MODEL_KEY = "benchmark_model"
+STANDARD_FORM_ROW_CAP = 100_000
 
 
 class BenchmarkValueKeys(NamedTuple):

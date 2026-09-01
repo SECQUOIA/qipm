@@ -22,6 +22,7 @@ from standard_form import _HIGHS_INF, load_standard_form
 
 from store import (
     SOLVE_RESULT_KEYS,
+    STANDARD_FORM_ROW_CAP,
     list_class_names,
     list_instance_dirs,
     merge_ledger,
@@ -33,6 +34,20 @@ from store import (
 SOLVE_TIMEOUT = 600.0  # 10 minutes per file
 HIGHS_THREADS = 1
 HIGHS_VERSION = highspy.Highs().version()
+
+
+def _standard_form_row_count(path: Path) -> int | None:
+    """Read the small stored shape member, or defer malformed archives to the solver."""
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            raw_shape = np.asarray(data["A_shape"]).ravel()
+        if not np.issubdtype(raw_shape.dtype, np.integer) or len(raw_shape) != 2:
+            return None
+        if np.any(raw_shape < 0):
+            return None
+        return int(raw_shape[0])
+    except Exception:  # noqa: BLE001 - the normal solve records malformed archives
+        return None
 
 
 def _merge_solve_result(path: Path, status: str, elapsed: float | None = None) -> None:
@@ -199,18 +214,15 @@ def solve_instance(
     mps_paths = sorted(instance_dir.glob("*.mps")) if format in ("mps", "both") else []
     std_paths = sorted(instance_dir.glob("*.std")) if format in ("std", "both") else []
 
-    mps_timed_out = False
     for p in mps_paths:
         if _solve_with_timeout(p) == "timeout":
             tqdm.write(f"timeout: {p.name} (skipping)")
-            mps_timed_out = True
-
-    if format == "both" and mps_timed_out:
-        for p in std_paths:
-            _merge_solve_result(p, "skipped_mps_timeout")
-        return
 
     for p in std_paths:
+        row_count = _standard_form_row_count(p)
+        if row_count is not None and row_count > STANDARD_FORM_ROW_CAP:
+            _merge_solve_result(p, "skipped_too_large")
+            continue
         if _solve_with_timeout(p) == "timeout":
             tqdm.write(f"timeout: {p.name} (skipping)")
 

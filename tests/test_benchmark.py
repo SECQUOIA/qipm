@@ -20,6 +20,7 @@ from benchmark import (
     show_benchmark_status,
 )
 from bounds import (
+    BasisSingularError,
     CycleCountResult,
     PreparedBasis,
     RankUncertainError,
@@ -348,6 +349,50 @@ def test_too_large_instance_records_skip(tmp_path: Path) -> None:
     assert data["status_oss"] == "skipped_too_large"
     assert "cycle_count_mnes" not in data
     assert "cycle_count_oss" not in data
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (BasisSingularError("Factor is exactly singular"), "basis_singular"),
+        (RuntimeError("other preprocessing failure"), "error:RuntimeError"),
+    ],
+)
+def test_preprocessing_runtime_failures_have_specific_status(
+    error: RuntimeError,
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    std_path = tmp_path / "failure.std"
+    _write_std(std_path, np.eye(2))
+
+    def fail(A, b):
+        raise error
+
+    monkeypatch.setattr(benchmark, "_preprocess_basis", fail)
+    _benchmark_instance_from_path(std_path, variant="both")
+
+    data = json.loads(std_path.with_suffix(".data").read_text())
+    assert data["status_mnes"] == expected
+    assert data["status_oss"] == expected
+
+
+def test_preprocess_wraps_only_singular_superlu_failure(monkeypatch) -> None:
+    def singular(matrix):
+        raise RuntimeError("Factor is exactly singular")
+
+    monkeypatch.setattr(sparse_linalg, "splu", singular)
+    with pytest.raises(BasisSingularError, match="exactly singular"):
+        _preprocess_basis(csr_matrix(np.eye(2)), np.ones(2))
+
+    def other_failure(matrix):
+        raise RuntimeError("some other superlu failure")
+
+    monkeypatch.setattr(sparse_linalg, "splu", other_failure)
+    with pytest.raises(RuntimeError, match="some other superlu failure") as caught:
+        _preprocess_basis(csr_matrix(np.eye(2)), np.ones(2))
+    assert not isinstance(caught.value, BasisSingularError)
 
 
 def test_corrupt_std_retracts_stale_benchmark_values(tmp_path: Path) -> None:

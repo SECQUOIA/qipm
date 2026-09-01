@@ -54,7 +54,7 @@ Without an argument, the script performs a shallow clone (`--depth 1`) of the re
 
 Two types of data are extracted:
 
-**MPS instances** — each zip in `mps/` is unpacked and its `.mps` files (from `min/` or `max/` subdirectories) are placed under `cache_dir/<class>/<stem>/`. Instance classes are assigned as follows:
+**MPS instances** — each zip in `mps/` is unpacked and its `.mps` files (from `min/` or `max/` subdirectories) are placed under `cache_dir/<class>/<stem>/`. Because the source archives encode objective sense in the directory name, extraction adds `OBJSENSE MAX` to files under `max/`; files under `min/` are unchanged. A `max/` file that already contains an objective-sense declaration is rejected. Empty entries are skipped, and a stem present under both senses is rejected. Instance classes are assigned as follows:
 
 | Zip | Class |
 |-----|-------|
@@ -91,7 +91,7 @@ Each MPS file is first presolved by HiGHS, then the reduced LP is algebraically 
 | Range $l \leq Ax \leq u$ | Add slack for upper bound; extra row $s_1 + s_2 = u - l$ |
 | Free row | Dropped entirely |
 
-After conversion, harmless zero rows with zero right-hand sides are removed. A zero row with a nonzero right-hand side is recorded as infeasible. The result is saved as a compressed NPZ file with extension `.std`. Variable shifts and the original MPS objective offset are stored as `obj_offset`, so $z_{\mathrm{mps}} = z_{\mathrm{std}} + \mathtt{obj\_offset}$.
+After conversion, harmless zero rows with zero right-hand sides are removed. A zero row with a nonzero right-hand side is recorded as infeasible. The result is saved as a compressed NPZ file with extension `.std`. Variable shifts and the original MPS objective offset are stored as `obj_offset`, so $z_{\mathrm{mps}} = z_{\mathrm{std}} + \mathtt{obj\_offset}$. For maximization instances, $z_{\mathrm{mps}} = -(z_{\mathrm{std}} + \mathtt{obj\_offset})$.
 
 The transform stage writes `transform_status` (`ok`, `reduced_to_empty`, `infeasible`, `unbounded`, `unbounded_or_infeasible`, or `error:<ExceptionName>`) to `.data`. An unchanged successful transform preserves downstream results. A changed successful transform clears them; every non-success conversion outcome removes a stale `.std` and clears them. Stage `--show` commands report successful totals with a breakdown of non-success statuses.
 
@@ -114,9 +114,9 @@ Each instance is solved in two independent modes, controlled by `--format`:
 
 For `.std`, if the default solver fails (e.g. due to poor scaling), the solve is automatically retried with HiGHS's interior-point method.
 
-Each solve runs in a subprocess with a 10-minute timeout. HiGHS is configured with `threads=1` before every solve; when `solve.py` starts the process, it also defaults the OpenMP, OpenBLAS, and MKL thread-count environment variables to 1 unless the user has set them explicitly. In `both` mode, if the `.mps` solve times out, the `.std` solve is recorded as `skipped_mps_timeout` without a runtime. The recorded wall time covers `Highs.run()` only and excludes model construction. It is written to the instance's `.data` JSON and serves as the classical baseline for the screening comparison.
+Each solve runs independently in a subprocess with a 10-minute timeout. HiGHS is configured with `threads=1` before every solve; when `solve.py` starts the process, it also defaults the OpenMP, OpenBLAS, and MKL thread-count environment variables to 1 unless the user has set them explicitly. Standard forms above the benchmark's 100,000-row cap are recorded as `skipped_too_large` without launching a solve; raw MPS solves remain ungated. The recorded wall time covers `Highs.run()` only and excludes model construction. It is written to the instance's `.data` JSON and serves as the classical baseline for the screening comparison.
 
-`solve_status_mps` and `solve_status_std` record `ok`, `ok_ipm`, `timeout`, `crashed`, `non_optimal`, `skipped_mps_timeout`, or `error:<ExceptionName>`. Runtime keys are present only for optimal solves. The top-level `highs_version` and `highs_threads` keys record solve provenance; the last solve-stage run for either format wins.
+`solve_status_mps` and `solve_status_std` record `ok`, `ok_ipm`, `timeout`, `crashed`, `non_optimal`, `skipped_too_large`, or `error:<ExceptionName>`. Runtime keys are present only for optimal solves. The top-level `highs_version` and `highs_threads` keys record solve provenance; the last solve-stage run for either format wins.
 
 ### 4. Benchmark
 
@@ -156,7 +156,7 @@ For each instance, the script reads $A$ and $b$ from the `.std` file; $b$ feeds 
 
 Each total obeys the exact invariant `cycle_count_x_v = qlsa_queries_x_v × tomography_reps_v`, with the empty `x` suffix denoting the modeled line.
 
-`status_mnes` and `status_oss` record `ok`, `timeout`, `crashed`, `skipped_too_large`, `skipped_degenerate`, `rank_uncertain`, `inconsistent_rows`, or `error:<ExceptionName>`. Instances with more than 100,000 rows are recorded as `skipped_too_large`, so the largest instances are excluded from the screened population. `benchmark.py --show` labels old successful records and statusless records carrying a finite legacy count `outdated_model`; records without benchmark fields are `absent`. Only `ok` records with `benchmark_model == 2` are current.
+`status_mnes` and `status_oss` record `ok`, `timeout`, `crashed`, `skipped_too_large`, `skipped_degenerate`, `rank_uncertain`, `inconsistent_rows`, `basis_singular`, or `error:<ExceptionName>`. Instances with more than 100,000 rows are recorded as `skipped_too_large`, so the largest instances are excluded from the screened population. `basis_singular` identifies a SuperLU singular-factor failure for the SPQR-selected basis. `benchmark.py --show` labels old successful records and statusless records carrying a finite legacy count `outdated_model`; records without benchmark fields are `absent`. Only `ok` records with `benchmark_model == 2` are current.
 
 **Basis preprocessing** — shared by both variants: SPQR (column-pivoted QR on $A$) selects a basis $B$ of size $m$ and identifies the non-basic columns $N$. If $A$ is rank-deficient, a secondary SPQR on $A^\top$ identifies dependent rows. A row is dropped only after an LSMR dependence certificate is checked against both $A$ and $b$; a mismatch is `inconsistent_rows`. The same kept-row selection is applied to $A$ and $b$. A sparse LU factorisation of $A_B$ is then computed once and reused by both variants.
 
@@ -192,9 +192,9 @@ Model-1 ledgers cannot be migrated because their stored sparsity and repetition 
 
 ### 5. Plot
 
-`plot.py` produces advantage curves, fixed-cycle ratio plots, and difficulty histograms from `.data`. The default classical baseline is now `--solver highs-std`; `glpk` and `highs-mps` remain available.
+`plot.py` produces advantage curves, fixed-cycle ratio plots, and difficulty histograms from `.data`. The default classical baseline is `--solver highs-std`; `glpk` and `highs-mps` remain available. `--estimate modeled`, `best-known`, or `floor` selects the query-cost estimate; the default preserves the existing filenames, while other estimates are included in their filenames. Condition numbers above $10^{16}$ are excluded per variant because they are not meaningful in double precision, except that `--variant both` advantage plots drop a record from both curves when either variant is excluded.
 
-Use `python plot.py --ratio` for fixed-cycle-time quantum/classical ratios. The default box style shows modeled serial query work $Q\times R$ and one QLSA state preparation (no readout) for MNES and OSS; `--ratio-style ecdf` selects empirical CDFs. $Q\times R$ is serial query work, not a hardware-independent wall-clock bound. `--cycle-time` sets an illustrative optimistic proxy for a logical cycle and defaults to $8\times10^{-10}$ s (800 ps), the $\sqrt{\mathrm{SWAP}}$ two-qubit gate reported by He et al., *Nature* **571**, 371 (2019), which Sec. V of the paper uses as an optimistic physical proxy. Plots report records with stale benchmark data (benchmark fields present but not model 2) and silently skip records that were never benchmarked; ratio plots also report invalid breakdowns, non-positive classical runtimes, and ratios too large for plotting.
+Use `python plot.py --ratio` for fixed-cycle-time quantum/classical ratios. The default box style shows selected serial query work $Q\times R$ and one QLSA state preparation (no readout) for MNES and OSS; `--ratio-style ecdf` selects empirical CDFs. $Q\times R$ is serial query work, not a hardware-independent wall-clock bound. `--cycle-time` sets an illustrative optimistic proxy for a logical cycle and defaults to $8\times10^{-10}$ s (800 ps), the $\sqrt{\mathrm{SWAP}}$ two-qubit gate reported by He et al., *Nature* **571**, 371 (2019), which Sec. V of the paper uses as an optimistic physical proxy. `--min-runtime` filters faster classical runtimes from advantage and ratio plots; about 0.01 s is recommended to remove solver overhead. Plots report these exclusions, records with stale benchmark data (benchmark fields present but not model 2), invalid ratio breakdowns, non-positive classical runtimes, and ratios too large for plotting; records that were never benchmarked are silently skipped.
 
 Plotting enables Matplotlib's LaTeX renderer, so a working LaTeX installation is required in addition to the Python packages.
 

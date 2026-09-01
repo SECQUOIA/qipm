@@ -9,7 +9,6 @@ import plot as plot_module
 from plot import (
     _advantage_pairs,
     _crossover_times,
-    _cycle_counts,
     _difficulty_bins,
     _ecdf,
     _load_advantage_data,
@@ -36,8 +35,9 @@ def test_advantage_loading_keeps_zero_runtime_and_filters_bad_counts(tmp_path) -
     )
     loaded = _load_advantage_data(["cls"], tmp_path, "runtime_glpk")
     assert len(loaded["cls"]) == 1
-    np.testing.assert_array_equal(_cycle_counts(loaded["cls"], "mnes"), [10.0])
-    assert _cycle_counts(loaded["cls"], "oss") is None
+    pairs = _advantage_pairs(loaded, ["mnes", "oss"], "runtime_glpk")
+    np.testing.assert_array_equal(pairs["cls"]["mnes"][0], [10.0])
+    assert "oss" not in pairs["cls"]
 
 
 def test_plot_loader_skips_and_reports_outdated_model(tmp_path, capsys) -> None:
@@ -121,6 +121,8 @@ def test_ratio_loading_filters_and_computes_both_ratios(tmp_path) -> None:
         "invalid_runtime": 1,
         "invalid_breakdown": 1,
         "unplottable_overflow": 0,
+        "condition_number": 0,
+        "min_runtime": 0,
     }
     assert eligible == 1
 
@@ -129,6 +131,146 @@ def test_ratio_cycle_time_must_be_positive_and_finite() -> None:
     for value in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError):
             _validate_cycle_time(value)
+
+
+@pytest.mark.parametrize(
+    ("estimate", "expected"),
+    [("best-known", 20.0), ("floor", 5.0)],
+)
+def test_estimate_selects_matching_count_and_query_keys(
+    estimate: str, expected: float, tmp_path
+) -> None:
+    instance_dir = tmp_path / "cls" / "item"
+    instance_dir.mkdir(parents=True)
+    (instance_dir / "item.data").write_text(json.dumps({
+        "benchmark_model": 2,
+        "runtime_highs_std": 2.0,
+        "cycle_count_mnes": 100,
+        "qlsa_queries_mnes": 10,
+        "cycle_count_best_known_mnes": 40,
+        "qlsa_queries_best_known_mnes": 4,
+        "cycle_count_floor_mnes": 10,
+        "qlsa_queries_floor_mnes": 1,
+        "tomography_reps_mnes": 10,
+    }))
+
+    loaded = _load_advantage_data(
+        ["cls"], tmp_path, "runtime_highs_std", estimate
+    )
+    pairs = _advantage_pairs(
+        loaded, ["mnes"], "runtime_highs_std", estimate
+    )
+    np.testing.assert_array_equal(
+        pairs["cls"]["mnes"][0],
+        [40.0 if estimate == "best-known" else 10.0],
+    )
+    ratio, skipped, eligible = _load_ratio_data(
+        ["cls"], tmp_path, "runtime_highs_std", 1.0, ["mnes"], estimate
+    )
+    np.testing.assert_array_equal(ratio["cls"]["mnes"][0], [expected])
+    assert skipped["invalid_breakdown"] == 0
+    assert eligible == 1
+
+
+def test_plot_loaders_report_condition_and_runtime_exclusions(
+    tmp_path, capsys
+) -> None:
+    records = {
+        "ill_conditioned": {
+            "runtime_highs_std": 1.0,
+            "cycle_count_mnes": 100,
+            "qlsa_queries_mnes": 10,
+            "tomography_reps_mnes": 10,
+            "sparsity_mnes": 2,
+            "cond_mnes": 1e17,
+            "cycle_count_oss": 200,
+            "qlsa_queries_oss": 20,
+            "tomography_reps_oss": 10,
+            "cond_oss": 2.0,
+        },
+        "too_fast": {
+            "runtime_highs_std": 0.005,
+            "cycle_count_mnes": 100,
+            "qlsa_queries_mnes": 10,
+            "tomography_reps_mnes": 10,
+            "sparsity_mnes": 2,
+            "cond_mnes": 2.0,
+        },
+    }
+    for name, record in records.items():
+        record["benchmark_model"] = 2
+        instance_dir = tmp_path / "cls" / name
+        instance_dir.mkdir(parents=True)
+        (instance_dir / f"{name}.data").write_text(json.dumps(record))
+
+    advantage = _load_advantage_data(
+        ["cls"], tmp_path, "runtime_highs_std", min_runtime=0.01
+    )
+    assert list(advantage["cls"]) == [records["ill_conditioned"]]
+    assert set(
+        _advantage_pairs(
+            advantage, ["mnes", "oss"], "runtime_highs_std"
+        )["cls"]
+    ) == {"oss"}
+    ratio, skipped, _ = _load_ratio_data(
+        ["cls"], tmp_path, "runtime_highs_std", 1.0,
+        ["mnes", "oss"], min_runtime=0.01,
+    )
+    assert set(ratio["cls"]) == {"oss"}
+    assert skipped["condition_number"] == 1
+    assert skipped["min_runtime"] == 1
+    assert _load_difficulty_data(["cls"], tmp_path, "mnes") == {
+        "cls": np.array([4.0])
+    }
+    output = capsys.readouterr().out
+    assert "condition number > 1e+16" in output
+    assert "records below the 0.01 s runtime floor" in output
+
+
+@pytest.mark.parametrize("excluded_variant", ["mnes", "oss"])
+def test_both_advantage_uses_common_condition_eligible_population(
+    excluded_variant, tmp_path, monkeypatch
+) -> None:
+    records = {
+        "eligible": {
+            "record_id": "eligible",
+            "runtime_highs_std": 1.0,
+            "cycle_count_mnes": 100,
+            "cond_mnes": 2.0,
+            "cycle_count_oss": 200,
+            "cond_oss": 3.0,
+        },
+        "condition_excluded": {
+            "record_id": "condition_excluded",
+            "runtime_highs_std": 1.0,
+            "cycle_count_mnes": 100,
+            "cond_mnes": 1e17 if excluded_variant == "mnes" else 2.0,
+            "cycle_count_oss": 200,
+            "cond_oss": 1e17 if excluded_variant == "oss" else 3.0,
+        },
+    }
+    for name, record in records.items():
+        record["benchmark_model"] = 2
+        instance_dir = tmp_path / "cls" / name
+        instance_dir.mkdir(parents=True)
+        (instance_dir / f"{name}.data").write_text(json.dumps(record))
+
+    seen_records = []
+    real_advantage_pairs = plot_module._advantage_pairs
+
+    def capture_pairs(data, variants, runtime_key, estimate="modeled"):
+        seen_records.extend(data["cls"])
+        return real_advantage_pairs(data, variants, runtime_key, estimate)
+
+    monkeypatch.setattr(plot_module, "_advantage_pairs", capture_pairs)
+    monkeypatch.setitem(plot_module._RCPARAMS, "text.usetex", False)
+    output = tmp_path / "advantage.pdf"
+    plot_module.plot_advantage(
+        ["cls"], "both", tmp_path, output, runtime_key="runtime_highs_std"
+    )
+
+    assert output.is_file()
+    assert [record["record_id"] for record in seen_records] == ["eligible"]
 
 
 def test_ratio_loading_checks_large_integer_invariant_exactly(tmp_path) -> None:

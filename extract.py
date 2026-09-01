@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -92,8 +93,79 @@ def _is_mps_in_min_max(entry_path: str) -> bool:
     return len(parts) >= 2 and ("min" in parts or "max" in parts)
 
 
-def _copy_zip_mps_to_cache(zip_path: Path, cache_path: Path, cache_class: str) -> None:
+def _entry_sense(entry_path: str) -> str:
+    parts = entry_path.replace("\\", "/").strip("/").split("/")
+    return "max" if "max" in parts else "min"
+
+
+def _with_objective_sense(content: bytes, sense: str, entry_path: str) -> bytes:
+    """Add the objective sense stripped by simplex-benchmarks to maximization MPS."""
+    if sense == "min":
+        return content
+    lines = content.splitlines(keepends=True)
+    for line in lines:
+        fields = line.lstrip().split(maxsplit=1)
+        section = fields[0].upper() if fields else b""
+        if section in (b"OBJSENSE", b"OBJSENS"):
+            raise RuntimeError(
+                f"Cannot preserve maximization sense for {entry_path}: "
+                "file already contains an objective-sense declaration"
+            )
+
+    name_index: int | None = None
+    for index, line in enumerate(lines):
+        fields = line.lstrip().split(maxsplit=1)
+        section = fields[0].upper() if fields else b""
+        if section == b"NAME" and name_index is None:
+            name_index = index
+        if section == b"ROWS":
+            insert_at = index if name_index is None else name_index + 1
+            anchor = index if name_index is None else name_index
+            newline = b"\r\n" if lines[anchor].endswith(b"\r\n") else b"\n"
+            if not lines[anchor].endswith((b"\n", b"\r")):
+                lines[anchor] += newline
+            lines.insert(insert_at, b"OBJSENSE" + newline + b" MAX" + newline)
+            return b"".join(lines)
+    raise ValueError("Cannot preserve maximization sense: MPS has no NAME or ROWS line")
+
+
+def _copy_zip_entry(
+    zf: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    dest: Path,
+    cache_class: str,
+    stem: str,
+    seen_senses: dict[tuple[str, str], str],
+) -> None:
+    instance = (cache_class, stem)
+    content = zf.read(info)
+    if not content:
+        if instance not in seen_senses:
+            dest.unlink(missing_ok=True)
+        warnings.warn(f"Skipping empty MPS zip entry: {info.filename}", stacklevel=2)
+        return
+    sense = _entry_sense(info.filename)
+    previous_sense = seen_senses.get(instance)
+    if previous_sense is not None and previous_sense != sense:
+        raise RuntimeError(
+            f"Objective-sense collision for {cache_class}/{stem}: "
+            f"found under both min/ and max/"
+        )
+    seen_senses[instance] = sense
+    atomic_write_bytes(
+        dest, _with_objective_sense(content, sense, info.filename)
+    )
+
+
+def _copy_zip_mps_to_cache(
+    zip_path: Path,
+    cache_path: Path,
+    cache_class: str,
+    seen_senses: dict[tuple[str, str], str] | None = None,
+) -> None:
     """Extract .mps files under min/ or max/ from zip into cache_path/cache_class/<stem>/."""
+    if seen_senses is None:
+        seen_senses = {}
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -103,11 +175,17 @@ def _copy_zip_mps_to_cache(zip_path: Path, cache_path: Path, cache_class: str) -
             name = Path(info.filename).name
             stem = Path(info.filename).stem
             dest = _contained_path(cache_path, cache_class, stem, name)
-            atomic_write_bytes(dest, zf.read(info.filename))
+            _copy_zip_entry(zf, info, dest, cache_class, stem, seen_senses)
 
 
-def _copy_zip_mps_by_filename(zip_path: Path, cache_path: Path) -> None:
+def _copy_zip_mps_by_filename(
+    zip_path: Path,
+    cache_path: Path,
+    seen_senses: dict[tuple[str, str], str] | None = None,
+) -> None:
     """Extract .mps from zip into clique/independent_set/vertex_cover by filename; one subfolder per instance."""
+    if seen_senses is None:
+        seen_senses = {}
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -120,7 +198,7 @@ def _copy_zip_mps_by_filename(zip_path: Path, cache_path: Path) -> None:
             if cache_class is None:
                 continue
             dest = _contained_path(cache_path, cache_class, stem, filename)
-            atomic_write_bytes(dest, zf.read(info.filename))
+            _copy_zip_entry(zf, info, dest, cache_class, stem, seen_senses)
 
 
 def _write_data_files_from_evaluation(clone_path: Path, cache_path: Path) -> None:
@@ -172,15 +250,18 @@ def extract(clone_path: Path, cache_path: Path) -> None:
     if not mps_dir.is_dir():
         return
 
+    seen_senses: dict[tuple[str, str], str] = {}
     for zip_basename, cache_class in ZIP_TO_CLASS.items():
         zip_path = mps_dir / f"{zip_basename}.zip"
         if zip_path.exists():
-            _copy_zip_mps_to_cache(zip_path, cache_path, cache_class)
+            _copy_zip_mps_to_cache(
+                zip_path, cache_path, cache_class, seen_senses
+            )
 
     for zip_basename in ZIP_BY_FILENAME:
         zip_path = mps_dir / f"{zip_basename}.zip"
         if zip_path.exists():
-            _copy_zip_mps_by_filename(zip_path, cache_path)
+            _copy_zip_mps_by_filename(zip_path, cache_path, seen_senses)
 
     _write_data_files_from_evaluation(clone_path, cache_path)
 

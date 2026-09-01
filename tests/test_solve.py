@@ -16,10 +16,12 @@ from solve import (
     HIGHS_VERSION,
     _merge_solve_result,
     _solve_instance_from_path,
+    _standard_form_row_count,
     show_solve_status,
     solve_instance,
 )
 from standard_form import write_standard_form
+from store import STANDARD_FORM_ROW_CAP
 from transform import transform_instance
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -192,7 +194,7 @@ def test_show_solve_status_accepts_ok_ipm_and_unhashable_status(
     assert "std: 1/2 (malformed: 1)" in capsys.readouterr().out
 
 
-def test_both_mode_mps_timeout_retracts_std_runtime(
+def test_both_mode_attempts_std_after_mps_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     instance_dir = tmp_path / "cls" / "item"
@@ -214,10 +216,56 @@ def test_both_mode_mps_timeout_retracts_std_runtime(
     monkeypatch.setattr(solve, "_solve_with_timeout", fake_solve)
     solve_instance("cls", "item", cache_dir=tmp_path, format="both")
 
-    data = json.loads((instance_dir / "item.data").read_text())
+    assert calls == [mps_path, std_path]
+
+
+def test_std_above_benchmark_cap_is_skipped_before_solve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance_dir = tmp_path / "cls" / "large"
+    instance_dir.mkdir(parents=True)
+    mps_path = instance_dir / "large.mps"
+    std_path = instance_dir / "large.std"
+    mps_path.write_text("unused")
+    _write_std(
+        std_path,
+        csr_matrix((STANDARD_FORM_ROW_CAP + 1, 2)),
+        np.zeros(STANDARD_FORM_ROW_CAP + 1),
+        np.ones(2),
+    )
+    (instance_dir / "large.data").write_text(json.dumps({
+        "runtime_highs_std": 12.5,
+        "solve_status_std": "ok",
+    }))
+    calls = []
+
+    def fake_solve(path: Path) -> str:
+        calls.append(path)
+        return "completed"
+
+    monkeypatch.setattr(solve, "_solve_with_timeout", fake_solve)
+    solve_instance("cls", "large", cache_dir=tmp_path, format="both")
+
+    data = json.loads((instance_dir / "large.data").read_text())
     assert calls == [mps_path]
-    assert data["solve_status_std"] == "skipped_mps_timeout"
+    assert data["solve_status_std"] == "skipped_too_large"
     assert "runtime_highs_std" not in data
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        (np.array([100_001, 2], dtype=np.int64), 100_001),
+        (np.array([100_001.0, 2.0]), None),
+    ],
+)
+def test_standard_form_row_count_requires_integer_shape(
+    shape: np.ndarray, expected: int | None, tmp_path: Path
+) -> None:
+    path = tmp_path / "shape.std"
+    with path.open("wb") as stream:
+        np.savez_compressed(stream, A_shape=shape)
+    assert _standard_form_row_count(path) == expected
 
 
 def test_fresh_solve_ledger_writes_runtime_before_status(tmp_path: Path) -> None:

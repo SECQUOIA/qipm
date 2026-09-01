@@ -7,6 +7,7 @@ import warnings
 from pathlib import Path
 
 import highspy
+import numpy as np
 from standard_form import (
     _atomic_write_std,
     _lp_to_standard_form,
@@ -46,7 +47,11 @@ def _withhold_standard_form(path: Path, status: str) -> None:
 
 
 def _transform_instance_impl(path: Path) -> bool | None:
-    """Read MPS file at path, presolve with HiGHS, convert to standard form, and save .std next to it."""
+    """Presolve an MPS and save its equivalent minimization standard form.
+
+    Maximization objectives are negated after presolve, so the saved optimum is
+    the negation of the MPS optimum.
+    """
     path = path.resolve()
     if not path.is_file():
         raise FileNotFoundError(f"MPS file not found: {path}")
@@ -62,8 +67,6 @@ def _transform_instance_impl(path: Path) -> bool | None:
         raise RuntimeError(f"HiGHS readModel failed: {status}")
 
     original_lp = h.getLp()
-    if original_lp.sense_ == highspy.ObjSense.kMaximize:
-        raise RuntimeError(f"Maximization model is not supported: {path}")
     integrality = getattr(original_lp, "integrality_", None)
     if integrality and any(v != highspy.HighsVarType.kContinuous for v in integrality):
         raise RuntimeError(f"Non-continuous variables are not supported: {path}")
@@ -108,12 +111,17 @@ def _transform_instance_impl(path: Path) -> bool | None:
     num_col = lp.num_col_
     num_row = lp.num_row_
     a = lp.a_matrix_
+    col_cost = lp.col_cost_
+    obj_offset = lp.offset_
+    if lp.sense_ == highspy.ObjSense.kMaximize:
+        col_cost = -np.asarray(col_cost, dtype=np.float64)
+        obj_offset = -obj_offset
     c, b, A, obj_offset = _lp_to_standard_form(
         num_col, num_row,
-        lp.col_cost_, lp.col_lower_, lp.col_upper_,
+        col_cost, lp.col_lower_, lp.col_upper_,
         lp.row_lower_, lp.row_upper_,
         a.start_, a.index_, a.value_,
-        lp.offset_,
+        obj_offset,
     )
 
     # Presolve normally removes empty rows. Keep this as defensive handling for

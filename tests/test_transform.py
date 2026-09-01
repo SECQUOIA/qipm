@@ -1,7 +1,9 @@
 """Regression tests for presolve and standard-form conversion."""
 
 import json
+import re
 import shutil
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +12,8 @@ from scipy.sparse import csr_matrix
 
 import highspy
 import transform
+from extract import _copy_zip_mps_to_cache
+from solve import solve_instance
 from standard_form import (
     _HIGHS_INF,
     _lp_to_standard_form,
@@ -139,6 +143,55 @@ def test_transform_records_reduced_to_empty(tmp_path: Path) -> None:
     transform_instance("cls", "equality", cache_dir=tmp_path)
     assert not (instance_dir / "equality.std").exists()
     assert json.loads((instance_dir / "equality.data").read_text())["transform_status"] == "reduced_to_empty"
+
+
+def test_extracted_maximization_matches_negated_minimization_and_solves(
+    tmp_path: Path,
+) -> None:
+    original_text = (FIXTURES / "surviving_range.mps").read_text()
+    original_text = original_text.replace(
+        "RHS\n", "RHS\n    RHS1      OBJ        7.0\n"
+    ).replace("LO BND1      Y1         0.0", "LO BND1      Y1        -1.0")
+    original = original_text.encode()
+    archive = tmp_path / "models.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("models/max/maximized.mps", original)
+    _copy_zip_mps_to_cache(archive, tmp_path, "cls")
+    max_path = tmp_path / "cls" / "maximized" / "maximized.mps"
+
+    highs = highspy.Highs()
+    highs.setOptionValue("log_to_console", False)
+    assert highs.readModel(str(max_path)) == highspy.HighsStatus.kOk
+    assert highs.getLp().sense_ == highspy.ObjSense.kMaximize
+
+    equivalent_dir = tmp_path / "cls" / "equivalent"
+    equivalent_dir.mkdir()
+    source = original.decode()
+    # HiGHS stores RHS OBJ v as offset -v, so the equivalent minimization
+    # negates that entry along with every column objective coefficient.
+    equivalent = re.sub(
+        r"(\bOBJ\s+)(-?\d+(?:\.\d+)?)",
+        lambda match: match.group(1) + str(-float(match.group(2))),
+        source,
+    )
+    (equivalent_dir / "equivalent.mps").write_text(equivalent)
+
+    transform_instance("cls", "maximized", cache_dir=tmp_path)
+    transform_instance("cls", "equivalent", cache_dir=tmp_path)
+    max_c, max_b, max_A, max_offset = _load_std(max_path.with_suffix(".std"))
+    min_c, min_b, min_A, min_offset = _load_std(
+        equivalent_dir / "equivalent.std"
+    )
+    np.testing.assert_array_equal(max_c, min_c)
+    np.testing.assert_array_equal(max_b, min_b)
+    np.testing.assert_array_equal(max_A.toarray(), min_A.toarray())
+    assert max_offset != 0.0
+    assert max_offset == min_offset
+
+    solve_instance("cls", "maximized", cache_dir=tmp_path, format="both")
+    data = json.loads(max_path.with_suffix(".data").read_text())
+    assert data["solve_status_mps"] in ("ok", "ok_ipm")
+    assert data["solve_status_std"] in ("ok", "ok_ipm")
 
 
 def test_zero_row_with_nonzero_rhs_is_infeasible(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 from bounds import (
+    BasisSingularError,
     CycleCountResult,
     DegenerateInstanceError,
     InconsistentSystemError,
@@ -26,6 +27,7 @@ from store import (
     BENCHMARK_RESULT_KEYS,
     BENCHMARK_STATUS_KEYS,
     BENCHMARK_VALUE_KEYS,
+    STANDARD_FORM_ROW_CAP,
     VARIANTS,
     atomic_write_json,
     list_class_names,
@@ -81,7 +83,7 @@ def _benchmark_instance_from_path(
     if A.shape[0] < 2 or A.shape[1] < 2:
         _skip("skipped_degenerate")
         return
-    if A.shape[0] > 100_000:
+    if A.shape[0] > STANDARD_FORM_ROW_CAP:
         _skip("skipped_too_large")
         return
 
@@ -96,6 +98,8 @@ def _benchmark_instance_from_path(
             return "inconsistent_rows"
         if isinstance(exc, DegenerateInstanceError):
             return "skipped_degenerate"
+        if isinstance(exc, BasisSingularError):
+            return "basis_singular"
         return f"error:{type(exc).__name__}"
 
     def _record_failure(active: str, exc: BaseException) -> None:

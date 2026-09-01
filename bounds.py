@@ -48,6 +48,10 @@ class DegenerateInstanceError(RuntimeError):
     """Preprocessing reduced the benchmark system below two rows."""
 
 
+class BasisSingularError(RuntimeError):
+    """SuperLU found the SPQR-selected basis to be exactly singular."""
+
+
 @dataclass(frozen=True)
 class BasisSelection:
     """Picklable basis-selection result sent by the preprocessing worker."""
@@ -401,6 +405,12 @@ def _preprocess_basis(A: csr_matrix, b: np.ndarray) -> PreparedBasis:
                     )
         if isinstance(result, Exception):
             raise result
+        try:
+            A_B_lu = splu(result.A_B_csc)
+        except RuntimeError as exc:
+            if "singular" in str(exc).lower():
+                raise BasisSingularError(str(exc)) from exc
+            raise
         return PreparedBasis(
             result.A,
             result.b,
@@ -409,7 +419,7 @@ def _preprocess_basis(A: csr_matrix, b: np.ndarray) -> PreparedBasis:
             result.B,
             result.N,
             result.n_N,
-            splu(result.A_B_csc),
+            A_B_lu,
             result.A_N,
         )
     finally:
