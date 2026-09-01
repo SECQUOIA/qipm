@@ -156,6 +156,8 @@ For each instance, the script reads $A$ and $b$ from the `.std` file; $b$ feeds 
 
 Each total obeys the exact invariant `cycle_count_x_v = qlsa_queries_x_v × tomography_reps_v`, with the empty `x` suffix denoting the modeled line.
 
+The three estimates are separate sensitivity models, not a nested hierarchy: the modeled and floor lines assume sparse access, while the best-known line assumes a normalized block encoding, so the "floor" ($\kappa\sqrt{s}$) exceeds the best-known total on most instances. See [LOWER_BOUND_REVISION.md](docs/LOWER_BOUND_REVISION.md) for the derivations.
+
 `status_mnes` and `status_oss` record `ok`, `timeout`, `crashed`, `skipped_too_large`, `skipped_degenerate`, `rank_uncertain`, `inconsistent_rows`, `basis_singular`, or `error:<ExceptionName>`. Instances with more than 100,000 rows are recorded as `skipped_too_large`, so the largest instances are excluded from the screened population. `basis_singular` identifies a SuperLU singular-factor failure for the SPQR-selected basis. `benchmark.py --show` labels old successful records and statusless records carrying a finite legacy count `outdated_model`; records without benchmark fields are `absent`. Only `ok` records with `benchmark_model == 2` are current.
 
 **Basis preprocessing** — shared by both variants: SPQR (column-pivoted QR on $A$) selects a basis $B$ of size $m$ and identifies the non-basic columns $N$. If $A$ is rank-deficient, a secondary SPQR on $A^\top$ identifies dependent rows. A row is dropped only after an LSMR dependence certificate is checked against both $A$ and $b$; a mismatch is `inconsistent_rows`. The same kept-row selection is applied to $A$ and $b$. A sparse LU factorisation of $A_B$ is then computed once and reused by both variants.

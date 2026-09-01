@@ -351,7 +351,7 @@ def plot_advantage(
     ax.set_xscale("log")
     ax.set_xlim(x_min, x_max)
     ax.set_xlabel("quantum cycle duration ($s$)", fontsize=11, labelpad=8)
-    ax.set_ylabel(r"instances with quantum advantage (\%)", fontsize=11, labelpad=8)
+    ax.set_ylabel(r"instances not excluded by the screen (\%)", fontsize=11, labelpad=8)
     ax.set_title(f"{ESTIMATE_LABELS[estimate]} query-cost estimate", fontsize=11)
     ax.set_ylim(0, 102)
     ax.set_yticks([0, 25, 50, 75, 100])

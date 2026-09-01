@@ -127,7 +127,9 @@ def _solve_std(path: Path) -> tuple[float | None, str]:
     t0 = time.perf_counter()
     status = h.run()
     if status not in (highspy.HighsStatus.kOk, highspy.HighsStatus.kWarning):
-        # Retry with IPM when default solver fails (e.g. badly scaled RHS); IPM often handles scaling better
+        # Retry with IPM when default solver fails (e.g. badly scaled RHS); IPM often handles scaling better.
+        # The timer restarts deliberately: the baseline is the successful attempt only, since a
+        # practitioner aware of the default-solver failure would run IPM directly.
         _check_highs_call(h.setOptionValue("solver", "ipm"), "set solver option")
         t0 = time.perf_counter()
         status = h.run()
